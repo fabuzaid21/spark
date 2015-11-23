@@ -22,6 +22,7 @@ import org.apache.spark.mllib.linalg.Vector
 import org.apache.spark.mllib.tree.impurity.ImpurityCalculator
 import org.apache.spark.mllib.tree.model.{InformationGainStats => OldInformationGainStats,
   Node => OldNode, Predict => OldPredict, ImpurityStats}
+import org.apache.spark.util.collection.BitSet
 
 /**
  * :: DeveloperApi ::
@@ -255,6 +256,7 @@ private[tree] class LearningNode(
     var leftChild: Option[LearningNode],
     var rightChild: Option[LearningNode],
     var split: Option[Split],
+    var dataSplits: BitSet,
     var isLeaf: Boolean,
     var stats: ImpurityStats) extends Serializable {
 
@@ -324,12 +326,12 @@ private[tree] object LearningNode {
       id: Int,
       isLeaf: Boolean,
       stats: ImpurityStats): LearningNode = {
-    new LearningNode(id, None, None, None, isLeaf, stats)
+    new LearningNode(id, None, None, None, null, isLeaf, stats)
   }
 
   /** Create an empty node with the given node index.  Values must be set later on. */
   def emptyNode(id: Int): LearningNode = {
-    new LearningNode(id, None, None, None, false, null)
+    new LearningNode(id, None, None, None, null, false, null)
   }
 
   // The below indexing methods were copied from spark.mllib.tree.model.Node

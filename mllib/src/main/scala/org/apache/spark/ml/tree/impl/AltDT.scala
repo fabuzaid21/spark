@@ -30,6 +30,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.collection.BitSet
 import org.roaringbitmap.RoaringBitmap
+import scala.collection.mutable.{Queue => MutableQueue}
 
 
 /**
@@ -92,6 +93,11 @@ private[ml] object AltDT extends Logging {
       strategy.maxBins, strategy.minInfoGain, strategy.impurity)
   }
 
+  var rootNode: LearningNode = null
+  var numRows: Int = -1
+  var labelsBc: Broadcast[Array[Double]] = null
+  var parentUID: Option[String] = None
+
   /**
    * Method to train a decision tree model over an RDD.
    */
@@ -103,9 +109,72 @@ private[ml] object AltDT extends Logging {
     // TODO: Check for empty dataset
     val numFeatures = input.first().features.size
     val rootNode = trainImpl(input, strategy)
-    impl.RandomForest.finalizeTree(rootNode, strategy.algo, strategy.numClasses, numFeatures,
-      parentUID)
+    this.parentUID = parentUID
+    impl.RandomForest.finalizeTree(rootNode, strategy.algo, strategy.numClasses, parentUID)
   }
+
+  /**
+    * Updates the model incrementally by adding/removing features
+    * @param newInputs features that will be added to our model
+    * @param colsToRemove features that will be removed from our model,
+    *                     encoded by the indices of the feature.
+    *                     If the feature is not present in the dataset,
+    *                     we ignore.
+    */
+  def update(newInputs: RDD[LabeledPoint], colsToRemove: Array[Int], strategy: Strategy):
+  DecisionTreeModel = {
+    // TODO: worry about merging categorical info from this strategy with
+    // original categorical info
+    val metadata = AltDTMetadata.fromStrategy(strategy)
+    val longNumRows: Long = newInputs.count()
+    require(longNumRows < Int.MaxValue, s"rowToColumnStore given RDD with $longNumRows rows," +
+      s" but can handle at most ${Int.MaxValue} rows")
+    assert(numRows == longNumRows.toInt, "new features must have the same number of data rows" +
+      "as the original features!")
+    val colStoreInit: RDD[(Int, Vector)] = rowToColumnStoreDense(newInputs.map(_.features), numRows)
+    val colStore: RDD[FeatureVector] = colStoreInit.map { case (featureIndex: Int, col: Vector) =>
+      val featureArity: Int = strategy.categoricalFeaturesInfo.getOrElse(featureIndex, 0)
+      FeatureVector.fromOriginal(featureIndex, featureArity, col)
+    }
+    // Group columns together into one array of columns per partition.
+    // TODO: Test avoiding this grouping, and see if it matters.
+    val groupedColStore: RDD[Array[FeatureVector]] = colStore.mapPartitions {
+      iterator: Iterator[FeatureVector] =>
+        if (iterator.nonEmpty) Iterator(iterator.toArray) else Iterator()
+    }
+    groupedColStore.persist(StorageLevel.MEMORY_AND_DISK)
+    // Initialize partitions with 1 node (each instance at the root node).
+    val newPartitionInfos: RDD[PartitionInfo] = groupedColStore.map { groupedCols =>
+      val initActive = new BitSet(1)
+      initActive.set(0)
+      new PartitionInfo(groupedCols, Array[Int](0, numRows), initActive)
+    }
+
+    val bestSplits: Array[(Option[Split], ImpurityStats)] =
+      computeBestSplits(newPartitionInfos, labelsBc, metadata)
+
+    val nodesToExamine: MutableQueue[LearningNode] = MutableQueue(rootNode)
+    // val nodesToRecompute: MutableQueue[LearningNode] = MutableQueue(rootNode)
+
+    var nodeIndexInLevel = 0
+    while (nodesToExamine.nonEmpty) {
+      val currNode = nodesToExamine.dequeue()
+      val statsForNode = bestSplits(nodeIndexInLevel)._2
+      if (rootNode.stats.gain < statsForNode.gain) {
+        // recompute the entire subtree form this rootNode
+
+      } else {
+        // add children
+        nodesToExamine += currNode.leftChild.get
+        nodesToExamine += currNode.rightChild.get
+      }
+    }
+
+
+
+    RandomForest.finalizeTree(this.rootNode.toNode, strategy.algo, strategy.numClasses, parentUID)
+  }
+
 
   private[impl] def trainImpl(input: RDD[LabeledPoint], strategy: Strategy): Node = {
     val metadata = AltDTMetadata.fromStrategy(strategy)
@@ -124,7 +193,7 @@ private[ml] object AltDT extends Logging {
         impurityCalculator)
     }
 
-    val numRows = {
+    numRows = {
       val longNumRows: Long = input.count()
       require(longNumRows < Int.MaxValue, s"rowToColumnStore given RDD with $longNumRows rows," +
         s" but can handle at most ${Int.MaxValue} rows")
@@ -136,7 +205,7 @@ private[ml] object AltDT extends Logging {
     //       Or is the mapping implicit (i.e., not costly)?
     val colStoreInit: RDD[(Int, Vector)] = rowToColumnStoreDense(input.map(_.features), numRows)
     val labels = input.map(_.label).collect()
-    val labelsBc = input.sparkContext.broadcast(labels)
+    labelsBc = input.sparkContext.broadcast(labels)
     // NOTE: Labels are not sorted with features since that would require 1 copy per feature,
     //       rather than 1 copy per worker. This means a lot of random accesses.
     //       We could improve this by applying first-level sorting (by node) to labels.
@@ -204,6 +273,10 @@ private[ml] object AltDT extends Logging {
           acc.or(bitv)
           acc
         }
+
+        // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right.
+        val aggBitVector: BitSet = aggregateBitVector(partitionInfos, splits, numRows)
+        activeNodePeriphery.foreach(node => node.dataSplits = aggBitVector)
         val newPartitionInfos = partitionInfos.map { partitionInfo =>
           partitionInfo.update(aggBitVector, numNodeOffsets)
         }
@@ -215,6 +288,7 @@ private[ml] object AltDT extends Logging {
     // Done with learning
     groupedColStore.unpersist()
     labelsBc.unpersist()
+    this.rootNode = rootNode
     rootNode.toNode
   }
 
@@ -299,7 +373,7 @@ private[ml] object AltDT extends Logging {
    * On driver: Grow tree based on chosen splits, and compute new set of active nodes.
    * @param oldPeriphery  Old periphery of active nodes.
    * @param bestSplitsAndGains  Best (split, gain) pairs, which can be zipped with the old
-   *                            periphery.  These stats will be used to replace the stats in
+   *                            periphery. These stats will be used to replace the stats in
    *                            any nodes which are split.
    * @param minInfoGain  Threshold for min info gain required to split a node.
    * @return  New active node periphery.
@@ -321,6 +395,7 @@ private[ml] object AltDT extends Logging {
           node.split = split
           node.isLeaf = false
           node.stats = stats
+          node.dataSplits = null
           Iterator(node.leftChild.get, node.rightChild.get)
         } else {
           node.isLeaf = true

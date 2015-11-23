@@ -65,6 +65,14 @@ abstract class Estimator[M <: Model[M]] extends PipelineStage {
   def fit(dataset: DataFrame): M
 
   /**
+    * Fits a model to the input data.
+    */
+  def update(newFeatures: DataFrame, featuresToRemove: Array[Int]): M = {
+    throw new IllegalArgumentException("This method needs to be " +
+      "overridden!")
+  }
+
+  /**
    * Fits multiple models to the input data with multiple sets of parameters.
    * The default implementation uses a for loop on each parameter map.
    * Subclasses could override this to optimize multi-model training.

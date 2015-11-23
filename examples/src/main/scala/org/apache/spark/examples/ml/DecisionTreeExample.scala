@@ -18,22 +18,23 @@
 // scalastyle:off println
 package org.apache.spark.examples.ml
 
-import scala.collection.mutable
-import scala.language.reflectiveCalls
-
-import scopt.OptionParser
-
-import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.examples.mllib.AbstractParams
-import org.apache.spark.ml.{Pipeline, PipelineStage, Transformer}
 import org.apache.spark.ml.classification.{DecisionTreeClassificationModel, DecisionTreeClassifier}
-import org.apache.spark.ml.feature.{VectorIndexer, StringIndexer}
+import org.apache.spark.ml.feature.StringIndexer
 import org.apache.spark.ml.regression.{DecisionTreeRegressionModel, DecisionTreeRegressor}
 import org.apache.spark.ml.util.MetadataUtils
-import org.apache.spark.mllib.evaluation.{RegressionMetrics, MulticlassMetrics}
+import org.apache.spark.ml.{Pipeline, PipelineStage, Transformer}
+import org.apache.spark.mllib.evaluation.{MulticlassMetrics, RegressionMetrics}
 import org.apache.spark.mllib.linalg.Vector
 import org.apache.spark.mllib.util.MLUtils
-import org.apache.spark.sql.{SQLContext, DataFrame}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.{DataFrame, SQLContext}
+import org.apache.spark.{SparkConf, SparkContext}
+import scopt.OptionParser
+
+import scala.collection.mutable
+import scala.language.reflectiveCalls
 
 
 /**
@@ -285,6 +286,8 @@ object DecisionTreeExample {
         }
       case _ => throw new IllegalArgumentException("Algo ${params.algo} not supported.")
     }
+
+    pipelineModel.update(null)
 
     // Evaluate model on training, test data
     labelType match {

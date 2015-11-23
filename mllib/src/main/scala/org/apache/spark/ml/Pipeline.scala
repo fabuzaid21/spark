@@ -136,7 +136,7 @@ class Pipeline(override val uid: String) extends Estimator[PipelineModel] with M
       }
     }
     var curDataset = dataset
-    val transformers = ListBuffer.empty[Transformer]
+    val transformers = ListBuffer.empty[PipelineStage]
     theStages.view.zipWithIndex.foreach { case (stage, index) =>
       if (index <= indexOfLastEstimator) {
         val transformer = stage match {
@@ -153,7 +153,7 @@ class Pipeline(override val uid: String) extends Estimator[PipelineModel] with M
         }
         transformers += transformer
       } else {
-        transformers += stage.asInstanceOf[Transformer]
+        transformers += stage// .asInstanceOf[Transformer]
       }
     }
 
@@ -279,11 +279,11 @@ object Pipeline extends MLReadable[Pipeline] {
 @Experimental
 class PipelineModel private[ml] (
     override val uid: String,
-    val stages: Array[Transformer])
-  extends Model[PipelineModel] with MLWritable with Logging {
+    val stages: Array[PipelineStage])
+  extends Model[PipelineModel] with Logging {
 
   /** A Java/Python-friendly auxiliary constructor. */
-  private[ml] def this(uid: String, stages: ju.List[Transformer]) = {
+  private[ml] def this(uid: String, stages: ju.List[PipelineStage]) = {
     this(uid, stages.asScala.toArray)
   }
 
@@ -294,7 +294,50 @@ class PipelineModel private[ml] (
 
   override def transform(dataset: DataFrame): DataFrame = {
     transformSchema(dataset.schema, logging = true)
-    stages.foldLeft(dataset)((cur, transformer) => transformer.transform(cur))
+    stages.foldLeft(dataset) { (cur, stage) =>
+      val transformer = stage.asInstanceOf[Transformer]
+      transformer.transform(cur)
+    }
+}
+
+  def update(dataset: DataFrame, colsToRemove: Array[Int] = Array()): PipelineModel = {
+    transformSchema(dataset.schema, logging = true)
+
+    // Search for the last estimator.
+    var indexOfLastEstimator = -1
+    stages.view.zipWithIndex.foreach { case (stage, index) =>
+      stage match {
+        case _: Estimator[_] =>
+          indexOfLastEstimator = index
+        case _ =>
+      }
+    }
+    var curDataset = dataset
+    val transformers = ListBuffer.empty[PipelineStage]
+    stages.view.zipWithIndex.foreach { case (stage, index) =>
+      if (index <= indexOfLastEstimator) {
+        val transformer = stage match {
+          case estimator: Estimator[_] =>
+            // scalastyle:off println
+            println("This works!")
+            // scalastyle:on println
+            estimator.update(curDataset, colsToRemove)
+          case t: Transformer =>
+            t
+          case _ =>
+            throw new IllegalArgumentException(
+              s"Do not support stage $stage of type ${stage.getClass}")
+        }
+        if (index < indexOfLastEstimator) {
+          curDataset = transformer.transform(curDataset)
+        }
+        transformers += transformer
+      } else {
+        transformers += stage// .asInstanceOf[Transformer]
+      }
+    }
+
+    new PipelineModel(uid, transformers.toArray).setParent(parent)
   }
 
   override def transformSchema(schema: StructType): StructType = {

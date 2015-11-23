@@ -73,6 +73,8 @@ final class DecisionTreeRegressor @Since("1.4.0") (@Since("1.4.0") override val 
 
   override def setSeed(value: Long): this.type = super.setSeed(value)
 
+  var model: DecisionTreeModel = null
+
   /**
    * Algorithm used for learning.
    * Supported: "byRow" or "byCol" (case sensitive).
@@ -97,13 +99,29 @@ final class DecisionTreeRegressor @Since("1.4.0") (@Since("1.4.0") override val 
       MetadataUtils.getCategoricalFeatures(dataset.schema($(featuresCol)))
     val oldDataset: RDD[LabeledPoint] = extractLabeledPoints(dataset)
     val strategy = getOldStrategy(categoricalFeatures)
-    val model = getAlgorithm match {
+    model = getAlgorithm match {
       case "byRow" =>
         val trees = RandomForest.run(oldDataset, strategy, numTrees = 1,
           featureSubsetStrategy = "all", seed = $(seed), parentUID = Some(uid))
         trees.head
       case "byCol" =>
         AltDT.train(oldDataset, strategy, parentUID = Some(uid))
+    }
+    model.asInstanceOf[DecisionTreeRegressionModel]
+  }
+
+  override def update(newFeatures: DataFrame, colsToRemove: Array[Int]):
+  DecisionTreeRegressionModel = {
+    val categoricalFeatures: Map[Int, Int] =
+      MetadataUtils.getCategoricalFeatures(newFeatures.schema($(featuresCol)))
+    val newData: RDD[LabeledPoint] = extractLabeledPoints(newFeatures)
+    val strategy = getOldStrategy(categoricalFeatures)
+    model = getAlgorithm match {
+      case "byCol" =>
+        AltDT.update(newData, colsToRemove, strategy)
+      case "byRow" =>
+        throw new IllegalArgumentException("update not supported for " +
+          "byRow yet!")
     }
     model.asInstanceOf[DecisionTreeRegressionModel]
   }
