@@ -175,9 +175,9 @@ private[ml] object AltDT extends Logging {
           if (statsOnNewCols._1.isDefined && statsOnNewCols._2.gain > currNode.stats.gain) {
             // one of the new features did perform better, so we need to recompute this node
             // and then make sure that its children are recomputed, too
-            this.partitionInfos.map { partitionInfo =>
-              partitionInfo.updateForSingleNode(instanceBitVector, currNodeIndex, fromOffset, toOffset)
-            }
+//            this.partitionInfos.map { partitionInfo =>
+//              partitionInfo.updateForSingleNode(instanceBitVector, currNodeIndex, fromOffset, toOffset)
+//            }
 
 
             // TODO: recompute
@@ -210,26 +210,26 @@ private[ml] object AltDT extends Logging {
     }
 
 
-    val nodesToExamine: MutableQueue[LearningNode] = MutableQueue(rootNode)
-    val nodesToRecompute: MutableQueue[LearningNode] = MutableQueue(rootNode)
-
-    while (nodesToExamine.nonEmpty) {
-      val currNode = nodesToExamine.dequeue()
-      val bestSplits: Array[(Option[Split], ImpurityStats)] =
-        computeBestSplits(newPartitionInfos, labelsBc, metadata)
-      val statsOnNewColumns = bestSplits(nodeIndexInLevel)._2
-      if (currNode.stats.gain < statsOnNewColumns.gain) {
-        // recompute the entire subtree form this node
-        nodesToRecompute += currNode
-      } else {
-        // add children
-        if (!currNode.isLeaf) {
-          nodesToExamine += currNode.leftChild.get
-          nodesToExamine += currNode.rightChild.get
-        }
-      }
-      nodeIndexInLevel += 1
-    }
+//    val nodesToExamine: MutableQueue[LearningNode] = MutableQueue(rootNode)
+//    val nodesToRecompute: MutableQueue[LearningNode] = MutableQueue(rootNode)
+//
+//    while (nodesToExamine.nonEmpty) {
+//      val currNode = nodesToExamine.dequeue()
+//      val bestSplits: Array[(Option[Split], ImpurityStats)] =
+//        computeBestSplits(newPartitionInfos, labelsBc, metadata)
+//      val statsOnNewColumns = bestSplits(nodeIndexInLevel)._2
+//      if (currNode.stats.gain < statsOnNewColumns.gain) {
+//        // recompute the entire subtree form this node
+//        nodesToRecompute += currNode
+//      } else {
+//        // add children
+//        if (!currNode.isLeaf) {
+//          nodesToExamine += currNode.leftChild.get
+//          nodesToExamine += currNode.rightChild.get
+//        }
+//      }
+//      nodeIndexInLevel += 1
+//    }
     impl.RandomForest.finalizeTree(this.rootNode.toNode, strategy.algo, strategy.numClasses,
                                    parentUID)
   }
@@ -1031,75 +1031,6 @@ private[ml] object AltDT extends Logging {
     // instances in left and right children during update
     val tempValsIndices: Array[(Double, Int)] = new Array[(Double, Int)](columns(0).values.length)
 
-    def updateForSingleNode(instanceBitVector: BitSet, nodeIdx: Int, from: Int,
-                            to: Int): PartitionInfo = {
-      val newNodeOffsets = nodeOffsets.map(Array(_))
-
-      val newColumns = columns.map { col =>
-        val rangeIndices = col.indices.slice(from, to)
-        val rangeValues = col.values.slice(from, to)
-        // if this is the very first time we split
-        // we don't have to use the indices to figure
-        // out which bits are turned on
-        val numBitsSet = if (nodeOffsets.length == 2) instanceBitVector.cardinality()
-        else rangeIndices.count(instanceBitVector.get)
-        val numBitsNotSet = to - from - numBitsSet
-
-        val oldOffset = newNodeOffsets(nodeIdx).head
-        // numBitsNotSet == number of instances going to the left
-        // which is how big the offset should be. If all instances
-        // go to the left/right, then this node was not split,
-        // so we do not need to update its part of the column.
-        // Otherwise, we update it.
-        if (numBitsNotSet == 0 || numBitsSet == 0) {
-          newNodeOffsets(nodeIdx) = Array(oldOffset)
-        } else {
-          newNodeOffsets(nodeIdx) = Array(oldOffset, oldOffset + numBitsNotSet)
-          // Sort range [from, to) based on split, then value. This is required to match
-          // the bit vector across all workers. See [[bitVectorFromSplit]] for details.
-          // Within [from, to), we will have all "left child" instances (those that are false),
-          // then all "right child" instances. Then, within each child, we sort by value, so
-          // we can compute the best split for the next iteration. The corresponding index for
-          // an instance is used to look up the split value ("left" or "right") in the
-          // instanceBitVector, which is ordered by index.
-
-          // BEGIN SORTING
-          // between [from, numBitsNotSet) and [numBitsNotSet, to)
-          // the columns need to be sorted by value. Since @rangeValues
-          // has already been sorted by value, we iterate from beginning to end
-          // (which preserves the sorted order), and then copy the values
-          // into a temporary buffer either 1) in the [from, numBitsNotSet) range
-          // or 2) in the [numBitsNotSet, to) range.
-          var (leftInstanceIdx, rightInstanceIdx) = (from, from + numBitsNotSet)
-          var idx = 0
-          while (idx < rangeValues.length) {
-            val indexForVal = rangeIndices(idx)
-            val bit = instanceBitVector.contains(indexForVal)
-            if (bit) {
-              tempValsIndices(rightInstanceIdx) = (rangeValues(idx), indexForVal)
-              rightInstanceIdx += 1
-            } else {
-              tempValsIndices(leftInstanceIdx) = (rangeValues(idx), indexForVal)
-              leftInstanceIdx += 1
-            }
-            idx += 1
-          }
-          // END SORTING
-
-          // update the column values and indices
-          // with the corresponding indices
-          var i = 0
-          while (i < rangeValues.length) {
-            col.values(from + i) = tempValsIndices(from + i)._1
-            col.indices(from + i) = tempValsIndices(from + i)._2
-            i += 1
-          }
-        }
-        col
-      }
-      PartitionInfo(newColumns, newNodeOffsets.flatten, activeNodes)
-    }
-
     /** For debugging */
     override def toString: String = {
       "PartitionInfo(" +
@@ -1218,6 +1149,75 @@ private[ml] object AltDT extends Logging {
         i += 1
       }
       PartitionInfo(newColumns, newNodeOffsets.flatten, newActiveNodes)
+    }
+
+    def updateForSingleNode(instanceBitVector: RoaringBitmap, nodeIdx: Int, from: Int,
+                            to: Int): PartitionInfo = {
+      val newNodeOffsets = nodeOffsets.map(Array(_))
+
+      val newColumns = columns.map { col =>
+        val rangeIndices = col.indices.slice(from, to)
+        val rangeValues = col.values.slice(from, to)
+        // if this is the very first time we split
+        // we don't have to use the indices to figure
+        // out which bits are turned on
+        val numBitsSet = if (nodeOffsets.length == 2) instanceBitVector.getCardinality()
+        else rangeIndices.count(instanceBitVector.contains)
+        val numBitsNotSet = to - from - numBitsSet
+
+        val oldOffset = newNodeOffsets(nodeIdx).head
+        // numBitsNotSet == number of instances going to the left
+        // which is how big the offset should be. If all instances
+        // go to the left/right, then this node was not split,
+        // so we do not need to update its part of the column.
+        // Otherwise, we update it.
+        if (numBitsNotSet == 0 || numBitsSet == 0) {
+          newNodeOffsets(nodeIdx) = Array(oldOffset)
+        } else {
+          newNodeOffsets(nodeIdx) = Array(oldOffset, oldOffset + numBitsNotSet)
+          // Sort range [from, to) based on split, then value. This is required to match
+          // the bit vector across all workers. See [[bitVectorFromSplit]] for details.
+          // Within [from, to), we will have all "left child" instances (those that are false),
+          // then all "right child" instances. Then, within each child, we sort by value, so
+          // we can compute the best split for the next iteration. The corresponding index for
+          // an instance is used to look up the split value ("left" or "right") in the
+          // instanceBitVector, which is ordered by index.
+
+          // BEGIN SORTING
+          // between [from, numBitsNotSet) and [numBitsNotSet, to)
+          // the columns need to be sorted by value. Since @rangeValues
+          // has already been sorted by value, we iterate from beginning to end
+          // (which preserves the sorted order), and then copy the values
+          // into a temporary buffer either 1) in the [from, numBitsNotSet) range
+          // or 2) in the [numBitsNotSet, to) range.
+          var (leftInstanceIdx, rightInstanceIdx) = (from, from + numBitsNotSet)
+          var idx = 0
+          while (idx < rangeValues.length) {
+            val indexForVal = rangeIndices(idx)
+            val bit = instanceBitVector.contains(indexForVal)
+            if (bit) {
+              tempValsIndices(rightInstanceIdx) = (rangeValues(idx), indexForVal)
+              rightInstanceIdx += 1
+            } else {
+              tempValsIndices(leftInstanceIdx) = (rangeValues(idx), indexForVal)
+              leftInstanceIdx += 1
+            }
+            idx += 1
+          }
+          // END SORTING
+
+          // update the column values and indices
+          // with the corresponding indices
+          var i = 0
+          while (i < rangeValues.length) {
+            col.values(from + i) = tempValsIndices(from + i)._1
+            col.indices(from + i) = tempValsIndices(from + i)._2
+            i += 1
+          }
+        }
+        col
+      }
+      PartitionInfo(newColumns, newNodeOffsets.flatten, activeNodes)
     }
   }
 }
