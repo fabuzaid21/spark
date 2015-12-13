@@ -30,7 +30,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.collection.BitSet
 import org.roaringbitmap.RoaringBitmap
-import scala.collection.mutable.{Queue => MutableQueue}
+import scala.collection.mutable.{Queue => MutableQueue, ArrayBuffer}
 
 
 /**
@@ -50,6 +50,7 @@ import scala.collection.mutable.{Queue => MutableQueue}
  * TODO: Update to use a sparse column store.
  */
 private[ml] object AltDT extends Logging {
+
 
   private[impl] class AltDTMetadata(
       val numClasses: Int,
@@ -93,6 +94,7 @@ private[ml] object AltDT extends Logging {
       strategy.maxBins, strategy.minInfoGain, strategy.impurity)
   }
 
+  var partitionInfos: RDD[PartitionInfo] = null
   var rootNode: LearningNode = null
   var numRows: Int = -1
   var labelsBc: Broadcast[Array[Double]] = null
@@ -136,8 +138,8 @@ private[ml] object AltDT extends Logging {
       val featureArity: Int = strategy.categoricalFeaturesInfo.getOrElse(featureIndex, 0)
       FeatureVector.fromOriginal(featureIndex, featureArity, col)
     }
-    // Group columns together into one array of columns per partition.
-    // TODO: Test avoiding this grouping, and see if it matters.
+
+    // group columns, just as before
     val groupedColStore: RDD[Array[FeatureVector]] = colStore.mapPartitions {
       iterator: Iterator[FeatureVector] =>
         if (iterator.nonEmpty) Iterator(iterator.toArray) else Iterator()
@@ -150,29 +152,86 @@ private[ml] object AltDT extends Logging {
       new PartitionInfo(groupedCols, Array[Int](0, numRows), initActive)
     }
 
-    val bestSplits: Array[(Option[Split], ImpurityStats)] =
-      computeBestSplits(newPartitionInfos, labelsBc, metadata)
+    this.partitionInfos = this.partitionInfos.union(newPartitionInfos)
 
-    val nodesToExamine: MutableQueue[LearningNode] = MutableQueue(rootNode)
-    // val nodesToRecompute: MutableQueue[LearningNode] = MutableQueue(rootNode)
+    // false == an old node that needs to be checked
+    // true == a new node that needs to be recomputed
+    var activePeriphery: Array[(LearningNode, Boolean)] = Array((rootNode, false))
+    var currLevel = 0
+    while (currLevel < strategy.maxDepth) {
+      var currNodeIndex = 0
+      val newActivePeriphery: ArrayBuffer[(LearningNode, Boolean)] = ArrayBuffer()
+      while (currNodeIndex < activePeriphery.length) {
+        val (currNode, recompute) = activePeriphery(currNodeIndex)
+        if (!recompute) {
+          // this is an "old" node: check to see if any of
+          // the new features perform better than the old ones
 
-    var nodeIndexInLevel = 0
-    while (nodesToExamine.nonEmpty) {
-      val currNode = nodesToExamine.dequeue()
-      val statsForNode = bestSplits(nodeIndexInLevel)._2
-      if (rootNode.stats.gain < statsForNode.gain) {
-        // recompute the entire subtree form this rootNode
+//          if (split.nonEmpty && stats.gain > minInfoGain) {
+          val (fromOffset, toOffset) = currNode.offsets
+          val statsOnNewCols : (Option[Split], ImpurityStats) =
+                computeBestSplitForSingleNode(newPartitionInfos, labelsBc, metadata,
+                                              fromOffset, toOffset)
+          if (statsOnNewCols._1.isDefined && statsOnNewCols._2.gain > currNode.stats.gain) {
+            // one of the new features did perform better, so we need to recompute this node
+            // and then make sure that its children are recomputed, too
+            this.partitionInfos.map { partitionInfo =>
+              partitionInfo.updateForSingleNode(instanceBitVector, currNodeIndex, fromOffset, toOffset)
+            }
 
-      } else {
-        // add children
-        nodesToExamine += currNode.leftChild.get
-        nodesToExamine += currNode.rightChild.get
+
+            // TODO: recompute
+            if (!currNode.isLeaf) {
+              newActivePeriphery += ((currNode.leftChild.get, true))
+              newActivePeriphery += ((currNode.leftChild.get, true))
+            }
+          } else {
+            // none of the new features did perform better,
+            // so we only need to check on the children
+            if (!currNode.isLeaf) {
+              newActivePeriphery += ((currNode.leftChild.get, false))
+              newActivePeriphery += ((currNode.leftChild.get, false))
+            }
+          }
+        } else {
+          // this is a "new" node: we need to recompute it,
+          // along with its children
+
+            // TODO: recompute
+            if (!currNode.isLeaf) {
+              newActivePeriphery += ((currNode.leftChild.get, true))
+              newActivePeriphery += ((currNode.leftChild.get, true))
+            }
+        }
+        currNodeIndex += 1
       }
+      activePeriphery = newActivePeriphery.toArray
+      currLevel += 1
     }
 
 
+    val nodesToExamine: MutableQueue[LearningNode] = MutableQueue(rootNode)
+    val nodesToRecompute: MutableQueue[LearningNode] = MutableQueue(rootNode)
 
-    RandomForest.finalizeTree(this.rootNode.toNode, strategy.algo, strategy.numClasses, parentUID)
+    while (nodesToExamine.nonEmpty) {
+      val currNode = nodesToExamine.dequeue()
+      val bestSplits: Array[(Option[Split], ImpurityStats)] =
+        computeBestSplits(newPartitionInfos, labelsBc, metadata)
+      val statsOnNewColumns = bestSplits(nodeIndexInLevel)._2
+      if (currNode.stats.gain < statsOnNewColumns.gain) {
+        // recompute the entire subtree form this node
+        nodesToRecompute += currNode
+      } else {
+        // add children
+        if (!currNode.isLeaf) {
+          nodesToExamine += currNode.leftChild.get
+          nodesToExamine += currNode.rightChild.get
+        }
+      }
+      nodeIndexInLevel += 1
+    }
+    impl.RandomForest.finalizeTree(this.rootNode.toNode, strategy.algo, strategy.numClasses,
+                                   parentUID)
   }
 
 
@@ -276,11 +335,17 @@ private[ml] object AltDT extends Logging {
 
         // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right.
         val aggBitVector: BitSet = aggregateBitVector(partitionInfos, splits, numRows)
-        activeNodePeriphery.foreach(node => node.dataSplits = aggBitVector)
-        val newPartitionInfos = partitionInfos.map { partitionInfo =>
+        partitionInfos = partitionInfos.map { partitionInfo =>
           partitionInfo.update(aggBitVector, numNodeOffsets)
         }
-        partitionInfos = newPartitionInfos
+        val nodeOffsets = partitionInfos.first.nodeOffsets
+        var i = 0
+        while (i < activeNodePeriphery.length) {
+          val node = activeNodePeriphery(i)
+          node.dataSplits = aggBitVector
+          node.offsets = (nodeOffsets(i), nodeOffsets(i + 1))
+          i += 1
+        }
       }
       currentLevel += 1
     }
@@ -289,6 +354,7 @@ private[ml] object AltDT extends Logging {
     groupedColStore.unpersist()
     labelsBc.unpersist()
     this.rootNode = rootNode
+    this.partitionInfos = partitionInfos
     rootNode.toNode
   }
 
@@ -370,6 +436,40 @@ private[ml] object AltDT extends Logging {
   }
 
   /**
+    * Find the best splits for a single active node. This is separate from @computeBestSplits
+    * since we need a different map function for each partitionInfo. A node is represented
+    * by its offsets in the dataset: @fromOffset and @toOffset
+    *  - On each partition, for each feature on the partition, select the best split
+    *    for the node.
+    *  - Each worker returns: best split + info gain
+    *  - We return the best split across the workers
+    * @return  A single (Option[Split, ImpurityStats) tuple for the given node,
+    *          where the split is None if no useful split exists
+    */
+  private [impl] def computeBestSplitForSingleNode(
+      partitionInfos: RDD[PartitionInfo],
+      labelsBc: Broadcast[Array[Double]],
+      metadata: AltDTMetadata, fromOffset: Int, toOffset: Int): (Option[Split], ImpurityStats) = {
+    val partBestSplitAndGain: RDD[(Option[Split], ImpurityStats)] = partitionInfos.map {
+      case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
+      activeNodes: BitSet) =>
+        val localLabels = labelsBc.value
+        val splitsAndStats =
+          columns.map { col =>
+            chooseSplit(col, localLabels, fromOffset, toOffset, metadata)
+          }
+        splitsAndStats.maxBy(_._2.gain)
+    }
+    partBestSplitAndGain.treeReduce { case((split1, gain1), (split2, gain2)) =>
+      if (gain1.gain >= gain2.gain) {
+        (split1, gain1)
+      } else {
+        (split2, gain2)
+      }
+    }
+  }
+
+  /**
    * On driver: Grow tree based on chosen splits, and compute new set of active nodes.
    * @param oldPeriphery  Old periphery of active nodes.
    * @param bestSplitsAndGains  Best (split, gain) pairs, which can be zipped with the old
@@ -396,6 +496,7 @@ private[ml] object AltDT extends Logging {
           node.isLeaf = false
           node.stats = stats
           node.dataSplits = null
+          node.offsets = null
           Iterator(node.leftChild.get, node.rightChild.get)
         } else {
           node.isLeaf = true
@@ -425,7 +526,7 @@ private[ml] object AltDT extends Logging {
       case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
                          activeNodes: BitSet) =>
         val localBestSplits: Array[Option[Split]] = bestSplitsBc.value
-        // localFeatureIndex[feature index] = index into PartitionInfo.columns
+        // localFeatureIndex(feature index) = index into PartitionInfo.columns
         val localFeatureIndex: Map[Int, Int] = columns.map(_.featureIndex).zipWithIndex.toMap
         val bitSetForNodes: Iterator[RoaringBitmap] = activeNodes.iterator
           .zip(localBestSplits.iterator).flatMap {
@@ -929,6 +1030,75 @@ private[ml] object AltDT extends Logging {
     // pre-allocated temporary buffer that we use to sort
     // instances in left and right children during update
     val tempValsIndices: Array[(Double, Int)] = new Array[(Double, Int)](columns(0).values.length)
+
+    def updateForSingleNode(instanceBitVector: BitSet, nodeIdx: Int, from: Int,
+                            to: Int): PartitionInfo = {
+      val newNodeOffsets = nodeOffsets.map(Array(_))
+
+      val newColumns = columns.map { col =>
+        val rangeIndices = col.indices.slice(from, to)
+        val rangeValues = col.values.slice(from, to)
+        // if this is the very first time we split
+        // we don't have to use the indices to figure
+        // out which bits are turned on
+        val numBitsSet = if (nodeOffsets.length == 2) instanceBitVector.cardinality()
+        else rangeIndices.count(instanceBitVector.get)
+        val numBitsNotSet = to - from - numBitsSet
+
+        val oldOffset = newNodeOffsets(nodeIdx).head
+        // numBitsNotSet == number of instances going to the left
+        // which is how big the offset should be. If all instances
+        // go to the left/right, then this node was not split,
+        // so we do not need to update its part of the column.
+        // Otherwise, we update it.
+        if (numBitsNotSet == 0 || numBitsSet == 0) {
+          newNodeOffsets(nodeIdx) = Array(oldOffset)
+        } else {
+          newNodeOffsets(nodeIdx) = Array(oldOffset, oldOffset + numBitsNotSet)
+          // Sort range [from, to) based on split, then value. This is required to match
+          // the bit vector across all workers. See [[bitVectorFromSplit]] for details.
+          // Within [from, to), we will have all "left child" instances (those that are false),
+          // then all "right child" instances. Then, within each child, we sort by value, so
+          // we can compute the best split for the next iteration. The corresponding index for
+          // an instance is used to look up the split value ("left" or "right") in the
+          // instanceBitVector, which is ordered by index.
+
+          // BEGIN SORTING
+          // between [from, numBitsNotSet) and [numBitsNotSet, to)
+          // the columns need to be sorted by value. Since @rangeValues
+          // has already been sorted by value, we iterate from beginning to end
+          // (which preserves the sorted order), and then copy the values
+          // into a temporary buffer either 1) in the [from, numBitsNotSet) range
+          // or 2) in the [numBitsNotSet, to) range.
+          var (leftInstanceIdx, rightInstanceIdx) = (from, from + numBitsNotSet)
+          var idx = 0
+          while (idx < rangeValues.length) {
+            val indexForVal = rangeIndices(idx)
+            val bit = instanceBitVector.contains(indexForVal)
+            if (bit) {
+              tempValsIndices(rightInstanceIdx) = (rangeValues(idx), indexForVal)
+              rightInstanceIdx += 1
+            } else {
+              tempValsIndices(leftInstanceIdx) = (rangeValues(idx), indexForVal)
+              leftInstanceIdx += 1
+            }
+            idx += 1
+          }
+          // END SORTING
+
+          // update the column values and indices
+          // with the corresponding indices
+          var i = 0
+          while (i < rangeValues.length) {
+            col.values(from + i) = tempValsIndices(from + i)._1
+            col.indices(from + i) = tempValsIndices(from + i)._2
+            i += 1
+          }
+        }
+        col
+      }
+      PartitionInfo(newColumns, newNodeOffsets.flatten, activeNodes)
+    }
 
     /** For debugging */
     override def toString: String = {

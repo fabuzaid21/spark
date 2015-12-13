@@ -257,6 +257,7 @@ private[tree] class LearningNode(
     var rightChild: Option[LearningNode],
     var split: Option[Split],
     var dataSplits: BitSet,
+    var offsets: (Int, Int),
     var isLeaf: Boolean,
     var stats: ImpurityStats) extends Serializable {
 
