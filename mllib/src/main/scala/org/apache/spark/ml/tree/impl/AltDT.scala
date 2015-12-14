@@ -32,6 +32,8 @@ import org.apache.spark.util.collection.BitSet
 import org.roaringbitmap.RoaringBitmap
 import scala.collection.mutable.{Queue => MutableQueue, ArrayBuffer}
 
+import scala.collection.mutable.{ArrayBuffer, Queue => MutableQueue}
+
 
 /**
  * DecisionTree which partitions data by feature.
@@ -152,41 +154,71 @@ private[ml] object AltDT extends Logging {
       new PartitionInfo(groupedCols, Array[Int](0, numRows), initActive)
     }
 
-    this.partitionInfos = this.partitionInfos.union(newPartitionInfos)
+    // reset all old partitionInfos to focus on the root node,
+    // as if we are learning a brand-new tree
+    this.partitionInfos.map { partitionInfo =>
+      partitionInfo.resetOffsets(numRows)
+    }
 
     // false == an old node that needs to be checked
     // true == a new node that needs to be recomputed
     var activePeriphery: Array[(LearningNode, Boolean)] = Array((rootNode, false))
     var currLevel = 0
-    while (currLevel < strategy.maxDepth) {
+    while (currLevel < strategy.maxDepth && activePeriphery.nonEmpty) {
       var currNodeIndex = 0
       val newActivePeriphery: ArrayBuffer[(LearningNode, Boolean)] = ArrayBuffer()
       while (currNodeIndex < activePeriphery.length) {
         val (currNode, recompute) = activePeriphery(currNodeIndex)
+        val (fromOffset, toOffset) = currNode.offsets
         if (!recompute) {
           // this is an "old" node: check to see if any of
           // the new features perform better than the old ones
 
-//          if (split.nonEmpty && stats.gain > minInfoGain) {
-          val (fromOffset, toOffset) = currNode.offsets
-          val statsOnNewCols : (Option[Split], ImpurityStats) =
-                computeBestSplitForSingleNode(newPartitionInfos, labelsBc, metadata,
-                                              fromOffset, toOffset)
-          if (statsOnNewCols._1.isDefined && statsOnNewCols._2.gain > currNode.stats.gain) {
-            // one of the new features did perform better, so we need to recompute this node
-            // and then make sure that its children are recomputed, too
-//            this.partitionInfos.map { partitionInfo =>
-//              partitionInfo.updateForSingleNode(instanceBitVector, currNodeIndex, fromOffset, toOffset)
-//            }
+          val (split, stats, bitVector) =
+            computeBestSplitAndBitVectorForSingleNode(newPartitionInfos, labelsBc, metadata,
+                                                      fromOffset, toOffset)
+          if (split.nonEmpty && stats.gain > currNode.stats.gain) {
+            // one of the new features did perform better, so we need to
+            // 1) update all partitionInfos with the new split encoded by the bitVector
+            // 2) update the fields of the current node and its children (If this node wasn't
+            //    split before, create children for it.)
+            // 3) add the children to the next activePeriphery to make sure they are
+            //    recomputed, too
 
-
-            // TODO: recompute
-            if (!currNode.isLeaf) {
-              newActivePeriphery += ((currNode.leftChild.get, true))
-              newActivePeriphery += ((currNode.leftChild.get, true))
+            // must call updateForSingleNode on both old features and new ones
+            this.partitionInfos.map { partitionInfo =>
+              partitionInfo.updateForSingleNode(bitVector, currNodeIndex, fromOffset, toOffset)
             }
+            newPartitionInfos.map { partitionInfo =>
+              partitionInfo.updateForSingleNode(bitVector, currNodeIndex, fromOffset, toOffset)
+            }
+
+            // Calculate what the new offsets for the left and right children should be
+            val numBitsSet = bitVector.getCardinality
+            val numBitsNotSet = fromOffset - toOffset - numBitsSet
+            val leftOffsets = (fromOffset, fromOffset + numBitsNotSet)
+            val rightOffsets = (fromOffset + numBitsNotSet, toOffset)
+
+            currNode.split = split
+            currNode.stats = stats
+            if (currNode.isLeaf) {
+              // if this node was a leaf in the old tree (and it's now being split)
+              // then we need to create two new children with new offsets
+              currNode.isLeaf = false
+              currNode.leftChild = Some(LearningNode(currNode.id * 2, isLeaf = false,
+                leftOffsets, ImpurityStats(stats.leftImpurity, stats.leftImpurityCalculator)))
+              currNode.rightChild = Some(LearningNode(currNode.id * 2 + 1, isLeaf = false,
+                rightOffsets, ImpurityStats(stats.rightImpurity, stats.rightImpurityCalculator)))
+            } else {
+              // else, we make sure the existing children have the correct new offsets
+              currNode.leftChild.get.offsets = leftOffsets
+              currNode.rightChild.get.offsets = rightOffsets
+            }
+            // these children must be recomputed, since the offsets are new
+            newActivePeriphery += ((currNode.leftChild.get, true))
+            newActivePeriphery += ((currNode.leftChild.get, true))
           } else {
-            // none of the new features did perform better,
+            // none of the new features performed better,
             // so we only need to check on the children
             if (!currNode.isLeaf) {
               newActivePeriphery += ((currNode.leftChild.get, false))
@@ -196,12 +228,60 @@ private[ml] object AltDT extends Logging {
         } else {
           // this is a "new" node: we need to recompute it,
           // along with its children
+          // same as the recompute == false case above; the only
+          // difference is that we use ALL features
+          // (including the old ones) to find the best split
 
-            // TODO: recompute
-            if (!currNode.isLeaf) {
-              newActivePeriphery += ((currNode.leftChild.get, true))
-              newActivePeriphery += ((currNode.leftChild.get, true))
+          val (split1, stats1, bitVector1) =
+            computeBestSplitAndBitVectorForSingleNode(this.partitionInfos, labelsBc, metadata,
+              fromOffset, toOffset)
+          val (split2, stats2, bitVector2) =
+            computeBestSplitAndBitVectorForSingleNode(newPartitionInfos, labelsBc, metadata,
+              fromOffset, toOffset)
+
+          // Between the best split amongst the old features
+          // and the best split amongst the new features,
+          // we pick the global best
+          val (split, stats, bitVector) = {
+            if (stats1.gain > stats2.gain) {
+              (split1, stats1, bitVector1)
+            } else {
+              (split2, stats2, bitVector2)
             }
+          }
+
+          this.partitionInfos.map { partitionInfo =>
+            partitionInfo.updateForSingleNode(bitVector, currNodeIndex, fromOffset, toOffset)
+          }
+          newPartitionInfos.map { partitionInfo =>
+            partitionInfo.updateForSingleNode(bitVector, currNodeIndex, fromOffset, toOffset)
+          }
+
+          // second difference between this branch and the case above:
+          // now the criteria for splitting is the minInfoGain
+          if (split.nonEmpty && stats.gain > metadata.minInfoGain) {
+            val numBitsSet = bitVector.getCardinality
+            val numBitsNotSet = fromOffset - toOffset - numBitsSet
+            val leftOffsets = (fromOffset, fromOffset + numBitsNotSet)
+            val rightOffsets = (fromOffset + numBitsNotSet, toOffset)
+
+            currNode.split = split
+            currNode.stats = stats
+            if (currNode.isLeaf) {
+              currNode.isLeaf = false
+              currNode.leftChild = Some(LearningNode(currNode.id * 2, isLeaf = false,
+                leftOffsets, ImpurityStats(stats.leftImpurity, stats.leftImpurityCalculator)))
+              currNode.rightChild = Some(LearningNode(currNode.id * 2 + 1, isLeaf = false,
+                rightOffsets, ImpurityStats(stats.rightImpurity, stats.rightImpurityCalculator)))
+            } else {
+              currNode.leftChild.get.offsets = leftOffsets
+              currNode.rightChild.get.offsets = rightOffsets
+            }
+            newActivePeriphery += ((currNode.leftChild.get, true))
+            newActivePeriphery += ((currNode.leftChild.get, true))
+          } else {
+            currNode.isLeaf = true
+          }
         }
         currNodeIndex += 1
       }
@@ -209,27 +289,9 @@ private[ml] object AltDT extends Logging {
       currLevel += 1
     }
 
+    // add newPartitionInfos to old ones, in case update is called again!
+    this.partitionInfos = this.partitionInfos.union(newPartitionInfos)
 
-//    val nodesToExamine: MutableQueue[LearningNode] = MutableQueue(rootNode)
-//    val nodesToRecompute: MutableQueue[LearningNode] = MutableQueue(rootNode)
-//
-//    while (nodesToExamine.nonEmpty) {
-//      val currNode = nodesToExamine.dequeue()
-//      val bestSplits: Array[(Option[Split], ImpurityStats)] =
-//        computeBestSplits(newPartitionInfos, labelsBc, metadata)
-//      val statsOnNewColumns = bestSplits(nodeIndexInLevel)._2
-//      if (currNode.stats.gain < statsOnNewColumns.gain) {
-//        // recompute the entire subtree form this node
-//        nodesToRecompute += currNode
-//      } else {
-//        // add children
-//        if (!currNode.isLeaf) {
-//          nodesToExamine += currNode.leftChild.get
-//          nodesToExamine += currNode.rightChild.get
-//        }
-//      }
-//      nodeIndexInLevel += 1
-//    }
     impl.RandomForest.finalizeTree(this.rootNode.toNode, strategy.algo, strategy.numClasses,
                                    parentUID)
   }
@@ -303,13 +365,6 @@ private[ml] object AltDT extends Logging {
       // Compute best split for each active node.
       val bestSplitsAndGains: Array[(Option[Split], ImpurityStats, RoaringBitmap)] =
         computeBestSplits(partitionInfos, labelsBc, metadata, numRows)
-      /*
-      // NOTE: The actual active nodes (activeNodePeriphery) may be a subset of the nodes under
-      //       bestSplitsAndGains since
-      assert(activeNodePeriphery.length == bestSplitsAndGains.length,
-        s"activeNodePeriphery.length=${activeNodePeriphery.length} does not equal" +
-          s" bestSplitsAndGains.length=${bestSplitsAndGains.length}")
-      */
 
       // Update current model and node periphery.
       // Note: This flatMap has side effects (on the model).
@@ -342,7 +397,6 @@ private[ml] object AltDT extends Logging {
         var i = 0
         while (i < activeNodePeriphery.length) {
           val node = activeNodePeriphery(i)
-          node.dataSplits = aggBitVector
           node.offsets = (nodeOffsets(i), nodeOffsets(i + 1))
           i += 1
         }
@@ -443,28 +497,40 @@ private[ml] object AltDT extends Logging {
     *    for the node.
     *  - Each worker returns: best split + info gain
     *  - We return the best split across the workers
-    * @return  A single (Option[Split, ImpurityStats) tuple for the given node,
+    * @return  A single (Option[Split, ImpurityStats, RoaringBitmap) tuple for the given node,
     *          where the split is None if no useful split exists
     */
-  private [impl] def computeBestSplitForSingleNode(
+  private [impl] def computeBestSplitAndBitVectorForSingleNode(
       partitionInfos: RDD[PartitionInfo],
       labelsBc: Broadcast[Array[Double]],
-      metadata: AltDTMetadata, fromOffset: Int, toOffset: Int): (Option[Split], ImpurityStats) = {
-    val partBestSplitAndGain: RDD[(Option[Split], ImpurityStats)] = partitionInfos.map {
+      metadata: AltDTMetadata, fromOffset: Int, toOffset: Int): (Option[Split],
+    ImpurityStats, RoaringBitmap) = {
+    val partBestSplitAndGain: RDD[(Option[Split], ImpurityStats, RoaringBitmap)] =
+      partitionInfos.map {
       case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
       activeNodes: BitSet) =>
+        val localFeatureIndex: Map[Int, Int] = columns.map(_.featureIndex).zipWithIndex.toMap
         val localLabels = labelsBc.value
         val splitsAndStats =
           columns.map { col =>
             chooseSplit(col, localLabels, fromOffset, toOffset, metadata)
           }
-        splitsAndStats.maxBy(_._2.gain)
+        val splitAndGain = splitsAndStats.maxBy(_._2.gain)
+        val (split, impurityStats) = splitAndGain
+        if (split.nonEmpty && impurityStats.gain > metadata.minInfoGain) {
+          val colIndex = localFeatureIndex(split.get.featureIndex)
+          val bitVector = bitVectorFromSplit(columns(colIndex), fromOffset, toOffset,
+                                             split.get, numRows)
+          (split, impurityStats, bitVector)
+        } else {
+          (split, impurityStats, new RoaringBitmap)
+        }
     }
-    partBestSplitAndGain.treeReduce { case((split1, gain1), (split2, gain2)) =>
+    partBestSplitAndGain.treeReduce { case((split1, gain1, bitv1), (split2, gain2, bitv2)) =>
       if (gain1.gain >= gain2.gain) {
-        (split1, gain1)
+        (split1, gain1, bitv1)
       } else {
-        (split2, gain2)
+        (split2, gain2, bitv2)
       }
     }
   }
@@ -495,7 +561,6 @@ private[ml] object AltDT extends Logging {
           node.split = split
           node.isLeaf = false
           node.stats = stats
-          node.dataSplits = null
           node.offsets = null
           Iterator(node.leftChild.get, node.rightChild.get)
         } else {
@@ -1149,6 +1214,19 @@ private[ml] object AltDT extends Logging {
         i += 1
       }
       PartitionInfo(newColumns, newNodeOffsets.flatten, newActiveNodes)
+    }
+
+
+    // BEGIN INCREMENTAL UPDATE METHODS
+    /**
+      * @return a new PartitionInfo that has reset its
+      *         node offsets to be (0, numRows) and its
+      *         activeNodes to be {0} (the root node)
+      */
+    def resetOffsets(numRows: Int): PartitionInfo = {
+      val newActiveNodes = new BitSet(1)
+      newActiveNodes.set(0)
+      new PartitionInfo(columns, Array[Int](0, numRows), newActiveNodes)
     }
 
     def updateForSingleNode(instanceBitVector: RoaringBitmap, nodeIdx: Int, from: Int,
