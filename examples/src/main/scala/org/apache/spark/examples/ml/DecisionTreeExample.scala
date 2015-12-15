@@ -64,6 +64,8 @@ object DecisionTreeExample {
       minInstancesPerNode: Int = 1,
       minInfoGain: Double = 0.0,
       fracTest: Double = 0.2,
+      fracInitialTraining: Double = 0.6,
+      fracIncrementalUpdate: Double = 0.1,
       cacheNodeIds: Boolean = false,
       checkpointDir: Option[String] = None,
       checkpointInterval: Int = 10) extends AbstractParams[Params]
@@ -97,6 +99,15 @@ object DecisionTreeExample {
         .text(s"fraction of data to hold out for testing.  If given option testInput, " +
           s"this option is ignored. default: ${defaultParams.fracTest}")
         .action((x, c) => c.copy(fracTest = x))
+      opt[Double]("fracInitialTraining")
+        .text(s"fraction of _training_ data columns to use as the initial training set." +
+          s"The rest are held out for incremental training later on." +
+          s" default: ${defaultParams.fracInitialTraining}")
+        .action((x, c) => c.copy(fracInitialTraining = x))
+      opt[Double]("fracIncrementalUpdate")
+        .text(s"Number of times to take the remaining training columns and incremental" +
+          s"update the model. default: ${defaultParams.fracIncrementalUpdate}")
+        .action((x, c) => c.copy(fracIncrementalUpdate = x))
       opt[Boolean]("cacheNodeIds")
         .text(s"whether to use node Id cache during training, " +
           s"default: ${defaultParams.cacheNodeIds}")
@@ -216,6 +227,14 @@ object DecisionTreeExample {
     val (training: DataFrame, test: DataFrame) =
       loadDatasets(sc, params.input, params.dataFormat, params.testInput, labelType, params.fracTest)
 
+    // partition training set into initial training set and array of feature chunks
+    // to add later
+    val num = Math.floor((1.0 - params.fracInitialTraining) / params.fracIncrementalUpdate).toInt
+    val splitWeights = Array(params.fracInitialTraining) ++
+                       Array.fill[Double](num)(params.fracIncrementalUpdate)
+
+    val trainSplits = training.randomSplit(splitWeights)
+
     // Set up Pipeline
     val stages = new mutable.ArrayBuffer[PipelineStage]()
     // (1) For classification, re-index classes.
@@ -264,7 +283,7 @@ object DecisionTreeExample {
 
     // Fit the Pipeline
     val startTime = System.nanoTime()
-    val pipelineModel = pipeline.fit(training)
+    val pipelineModel = pipeline.fit(trainSplits(0))
     val elapsedTime = (System.nanoTime() - startTime) / 1e9
     println(s"Training time: $elapsedTime seconds")
 
@@ -287,8 +306,6 @@ object DecisionTreeExample {
       case _ => throw new IllegalArgumentException("Algo ${params.algo} not supported.")
     }
 
-    pipelineModel.update(null)
-
     // Evaluate model on training, test data
     labelType match {
       case "classification" =>
@@ -303,6 +320,26 @@ object DecisionTreeExample {
         evaluateRegressionModel(pipelineModel, test, labelColName)
       case _ =>
         throw new IllegalArgumentException("Algo ${params.algo} not supported.")
+    }
+
+    trainSplits.drop(1).foreach { newFeatures =>
+      pipelineModel.update(newFeatures)
+
+      // Evaluate model on training, test data
+      algo match {
+        case "classification" =>
+          println("Training data results:")
+          evaluateClassificationModel(pipelineModel, training, labelColName)
+          println("Test data results:")
+          evaluateClassificationModel(pipelineModel, test, labelColName)
+        case "regression" =>
+          println("Training data results:")
+          evaluateRegressionModel(pipelineModel, training, labelColName)
+          println("Test data results:")
+          evaluateRegressionModel(pipelineModel, test, labelColName)
+        case _ =>
+          throw new IllegalArgumentException("Algo ${params.algo} not supported.")
+      }
     }
 
     sc.stop()

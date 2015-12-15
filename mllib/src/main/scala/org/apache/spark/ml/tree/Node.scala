@@ -21,6 +21,7 @@ import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.mllib.linalg.Vector
 import org.apache.spark.mllib.tree.impurity.ImpurityCalculator
 import org.apache.spark.mllib.tree.model.{ImpurityStats, InformationGainStats => OldInformationGainStats, Node => OldNode, Predict => OldPredict}
+import org.roaringbitmap.RoaringBitmap
 
 /**
  * :: DeveloperApi ::
@@ -254,6 +255,7 @@ private[tree] class LearningNode(
     var leftChild: Option[LearningNode],
     var rightChild: Option[LearningNode],
     var split: Option[Split],
+    var bitVectorSplit: RoaringBitmap,
     var offsets: (Int, Int),
     var isLeaf: Boolean,
     var stats: ImpurityStats) extends Serializable {
@@ -324,7 +326,7 @@ private[tree] object LearningNode {
       id: Int,
       isLeaf: Boolean,
       stats: ImpurityStats): LearningNode = {
-    new LearningNode(id, None, None, None, null, isLeaf, stats)
+    new LearningNode(id, None, None, None, null, null, isLeaf, stats)
   }
 
   def apply(
@@ -332,12 +334,12 @@ private[tree] object LearningNode {
              isLeaf: Boolean,
              offsets: (Int, Int),
              stats: ImpurityStats): LearningNode = {
-    new LearningNode(id, None, None, None, offsets, isLeaf, stats)
+    new LearningNode(id, None, None, None, null, offsets, isLeaf, stats)
   }
 
   /** Create an empty node with the given node index.  Values must be set later on. */
   def emptyNode(id: Int): LearningNode = {
-    new LearningNode(id, None, None, None, null, false, null)
+    new LearningNode(id, None, None, None, null, null, false, null)
   }
 
   // The below indexing methods were copied from spark.mllib.tree.model.Node

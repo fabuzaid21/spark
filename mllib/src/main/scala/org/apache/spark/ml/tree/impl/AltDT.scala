@@ -32,7 +32,7 @@ import org.apache.spark.util.collection.BitSet
 import org.roaringbitmap.RoaringBitmap
 import scala.collection.mutable.{Queue => MutableQueue, ArrayBuffer}
 
-import scala.collection.mutable.{ArrayBuffer, Queue => MutableQueue}
+import scala.collection.mutable.ArrayBuffer
 
 
 /**
@@ -224,6 +224,12 @@ private[ml] object AltDT extends Logging {
               newActivePeriphery += ((currNode.leftChild.get, false))
               newActivePeriphery += ((currNode.leftChild.get, false))
             }
+
+            // update new features to be correctly sorted for this next level of the tree
+            newPartitionInfos.map { partitionInfo =>
+              partitionInfo.updateForSingleNode(currNode.bitVectorSplit, currNodeIndex,
+                                                currNode.offsets._1, currNode.offsets._2)
+            }
           }
         } else {
           // this is a "new" node: we need to recompute it,
@@ -398,6 +404,7 @@ private[ml] object AltDT extends Logging {
         while (i < activeNodePeriphery.length) {
           val node = activeNodePeriphery(i)
           node.offsets = (nodeOffsets(i), nodeOffsets(i + 1))
+          node.bitVectorSplit = bitVectorMap(i)
           i += 1
         }
       }
@@ -584,16 +591,16 @@ private[ml] object AltDT extends Logging {
   private[impl] def aggregateBitVector(
       partitionInfos: RDD[PartitionInfo],
       bestSplits: Array[Option[Split]],
-      numRows: Int): RoaringBitmap = {
+      numRows: Int): Map[Int, RoaringBitmap] = {
     val bestSplitsBc: Broadcast[Array[Option[Split]]] =
       partitionInfos.sparkContext.broadcast(bestSplits)
-    val workerBitSubvectors: RDD[RoaringBitmap] = partitionInfos.map {
+    val workerBitSubvectors: RDD[(Int, RoaringBitmap)] = partitionInfos.flatMap {
       case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
                          activeNodes: BitSet) =>
         val localBestSplits: Array[Option[Split]] = bestSplitsBc.value
         // localFeatureIndex(feature index) = index into PartitionInfo.columns
         val localFeatureIndex: Map[Int, Int] = columns.map(_.featureIndex).zipWithIndex.toMap
-        val bitSetForNodes: Iterator[RoaringBitmap] = activeNodes.iterator
+        val bitSetForNodes: Iterator[(Int, RoaringBitmap)] = activeNodes.iterator
           .zip(localBestSplits.iterator).flatMap {
           case (nodeIndexInLevel: Int, Some(split: Split)) =>
             if (localFeatureIndex.contains(split.featureIndex)) {
@@ -601,7 +608,8 @@ private[ml] object AltDT extends Logging {
               val fromOffset = nodeOffsets(nodeIndexInLevel)
               val toOffset = nodeOffsets(nodeIndexInLevel + 1)
               val colIndex: Int = localFeatureIndex(split.featureIndex)
-              Iterator(bitVectorFromSplit(columns(colIndex), fromOffset, toOffset, split, numRows))
+              Iterator((nodeIndexInLevel, bitVectorFromSplit(columns(colIndex), fromOffset,
+                                                             toOffset, split, numRows)))
             } else {
               Iterator()
             }
@@ -611,18 +619,19 @@ private[ml] object AltDT extends Logging {
             // split, by how many instances go left/right.
             Iterator()
         }
-        if (bitSetForNodes.isEmpty) {
-          new RoaringBitmap()
-        } else {
-          bitSetForNodes.reduce[RoaringBitmap] { (acc, bitv) => acc.or(bitv); acc }
-        }
+        bitSetForNodes
+//        if (bitSetForNodes.isEmpty) {
+//          new RoaringBitmap()
+//        } else {
+//          bitSetForNodes.reduce[RoaringBitmap] { (acc, bitv) => acc.or(bitv); acc }
+//        }
     }
-    val aggBitVector: RoaringBitmap = workerBitSubvectors.reduce { (acc, bitv) =>
-      acc.or(bitv)
-      acc
-    }
+//    val aggBitVector: RoaringBitmap = workerBitSubvectors.reduce { (acc, bitv) =>
+//      acc.or(bitv)
+//      acc
+//    }
     bestSplitsBc.unpersist()
-    aggBitVector
+    workerBitSubvectors.collect.toMap
   }
 
   /**

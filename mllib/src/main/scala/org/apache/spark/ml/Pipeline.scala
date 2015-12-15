@@ -318,9 +318,6 @@ class PipelineModel private[ml] (
       if (index <= indexOfLastEstimator) {
         val transformer = stage match {
           case estimator: Estimator[_] =>
-            // scalastyle:off println
-            println("This works!")
-            // scalastyle:on println
             estimator.update(curDataset, colsToRemove)
           case t: Transformer =>
             t
