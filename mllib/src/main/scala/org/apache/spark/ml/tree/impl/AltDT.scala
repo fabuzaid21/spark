@@ -205,12 +205,7 @@ private[ml] object AltDT extends Logging {
         val newPartitionInfos = partitionInfos.map { partitionInfo =>
           partitionInfo.update(aggBitVectorsBc.value, numNodeOffsets)
         }
-        // TODO: remove.  For some reason, this is needed to make things work.
-        // Probably messing up somewhere above...
-        newPartitionInfos.cache().count()
         partitionInfos = newPartitionInfos
-
-        // TODO: unpersist aggBitVectorsBc after action.
       }
 
       currentLevel += 1
