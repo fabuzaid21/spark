@@ -20,7 +20,7 @@ package org.apache.spark.examples.ml
 
 import org.apache.spark.examples.mllib.AbstractParams
 import org.apache.spark.ml.classification.{DecisionTreeClassificationModel, DecisionTreeClassifier}
-import org.apache.spark.ml.feature.StringIndexer
+import org.apache.spark.ml.feature.{VectorIndexer, StringIndexer}
 import org.apache.spark.ml.regression.{DecisionTreeRegressionModel, DecisionTreeRegressor}
 import org.apache.spark.ml.util.MetadataUtils
 import org.apache.spark.ml.{Pipeline, PipelineStage, Transformer}
@@ -225,7 +225,8 @@ object DecisionTreeExample {
 
     // Load training and test data and cache it.
     val (training: DataFrame, test: DataFrame) =
-      loadDatasets(sc, params.input, params.dataFormat, params.testInput, labelType, params.fracTest)
+      loadDatasets(sc, params.input, params.dataFormat, params.testInput, labelType,
+        params.fracTest)
 
     // partition training set into initial training set and array of feature chunks
     // to add later
@@ -326,7 +327,7 @@ object DecisionTreeExample {
       pipelineModel.update(newFeatures)
 
       // Evaluate model on training, test data
-      algo match {
+      labelType match {
         case "classification" =>
           println("Training data results:")
           evaluateClassificationModel(pipelineModel, training, labelColName)

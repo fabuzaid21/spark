@@ -30,9 +30,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.collection.BitSet
 import org.roaringbitmap.RoaringBitmap
-import scala.collection.mutable.{Queue => MutableQueue, ArrayBuffer}
 
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.{ArrayBuffer, Queue => MutableQueue}
 
 
 /**
@@ -101,6 +100,7 @@ private[ml] object AltDT extends Logging {
   var numRows: Int = -1
   var labelsBc: Broadcast[Array[Double]] = null
   var parentUID: Option[String] = None
+  var numFeatures: Int = 0
 
   /**
    * Method to train a decision tree model over an RDD.
@@ -111,10 +111,11 @@ private[ml] object AltDT extends Logging {
       parentUID: Option[String] = None): DecisionTreeModel = {
     // TODO: Check validity of params
     // TODO: Check for empty dataset
-    val numFeatures = input.first().features.size
+    numFeatures = input.first().features.size
     val rootNode = trainImpl(input, strategy)
     this.parentUID = parentUID
-    impl.RandomForest.finalizeTree(rootNode, strategy.algo, strategy.numClasses, parentUID)
+    impl.RandomForest.finalizeTree(rootNode, strategy.algo, strategy.numClasses, numFeatures,
+      this.parentUID)
   }
 
   /**
@@ -127,6 +128,7 @@ private[ml] object AltDT extends Logging {
     */
   def update(newInputs: RDD[LabeledPoint], colsToRemove: Array[Int], strategy: Strategy):
   DecisionTreeModel = {
+    numFeatures += newInputs.first().features.size
     // TODO: worry about merging categorical info from this strategy with
     // original categorical info
     val metadata = AltDTMetadata.fromStrategy(strategy)
@@ -299,7 +301,7 @@ private[ml] object AltDT extends Logging {
     this.partitionInfos = this.partitionInfos.union(newPartitionInfos)
 
     impl.RandomForest.finalizeTree(this.rootNode.toNode, strategy.algo, strategy.numClasses,
-                                   parentUID)
+      numFeatures, this.parentUID)
   }
 
 
@@ -389,13 +391,15 @@ private[ml] object AltDT extends Logging {
 
       if (!doneLearning) {
         // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right
-        val aggBitVector = bestSplitsAndGains.map(_._3).reduce[RoaringBitmap] { (acc, bitv) =>
+        val bitVectorMap = bestSplitsAndGains.map(_._3).filterNot(x => x.isEmpty)
+        assert(bitVectorMap.length == activeNodePeriphery.length, s"bitVectorMap " +
+          s"length ${bitVectorMap.length} should be equal to activeNodePeriphery " +
+          s"length ${activeNodePeriphery.length}")
+        val aggBitVector = bitVectorMap.reduce[RoaringBitmap] { (acc, bitv) =>
           acc.or(bitv)
           acc
         }
 
-        // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right.
-        val aggBitVector: BitSet = aggregateBitVector(partitionInfos, splits, numRows)
         partitionInfos = partitionInfos.map { partitionInfo =>
           partitionInfo.update(aggBitVector, numNodeOffsets)
         }

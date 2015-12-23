@@ -346,7 +346,7 @@ class PipelineModel private[ml] (
   }
 
   @Since("1.6.0")
-  override def write: MLWriter = new PipelineModel.PipelineModelWriter(this)
+  def write: MLWriter = new PipelineModel.PipelineModelWriter(this)
 }
 
 @Since("1.6.0")
@@ -375,12 +375,7 @@ object PipelineModel extends MLReadable[PipelineModel] {
 
     override def load(path: String): PipelineModel = {
       val (uid: String, stages: Array[PipelineStage]) = SharedReadWrite.load(className, sc, path)
-      val transformers = stages map {
-        case stage: Transformer => stage
-        case other => throw new RuntimeException(s"PipelineModel.read loaded a stage but found it" +
-          s" was not a Transformer.  Bad stage ${other.uid} of type ${other.getClass}")
-      }
-      new PipelineModel(uid, transformers)
+      new PipelineModel(uid, stages)
     }
   }
 }
