@@ -20,21 +20,20 @@ package org.apache.spark.examples.ml
 
 import org.apache.spark.examples.mllib.AbstractParams
 import org.apache.spark.ml.classification.{DecisionTreeClassificationModel, DecisionTreeClassifier}
-import org.apache.spark.ml.feature.{VectorIndexer, StringIndexer}
+import org.apache.spark.ml.feature.{VectorSlicer, StringIndexer, VectorIndexer}
 import org.apache.spark.ml.regression.{DecisionTreeRegressionModel, DecisionTreeRegressor}
 import org.apache.spark.ml.util.MetadataUtils
 import org.apache.spark.ml.{Pipeline, PipelineStage, Transformer}
 import org.apache.spark.mllib.evaluation.{MulticlassMetrics, RegressionMetrics}
-import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.mllib.util.MLUtils
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.types.StringType
 import org.apache.spark.sql.{DataFrame, SQLContext}
 import org.apache.spark.{SparkConf, SparkContext}
 import scopt.OptionParser
 
 import scala.collection.mutable
 import scala.language.reflectiveCalls
+import scala.util.Random
 
 
 /**
@@ -224,17 +223,39 @@ object DecisionTreeExample {
     println(s"DecisionTreeExample with parameters:\n$params")
 
     // Load training and test data and cache it.
-    val (training: DataFrame, test: DataFrame) =
+    val (training: DataFrame, initTest: DataFrame) =
       loadDatasets(sc, params.input, params.dataFormat, params.testInput, labelType,
         params.fracTest)
-
+    val numFeatures = training.select("features").first().getAs[Vector](0).size
     // partition training set into initial training set and array of feature chunks
     // to add later
-    val num = Math.floor((1.0 - params.fracInitialTraining) / params.fracIncrementalUpdate).toInt
-    val splitWeights = Array(params.fracInitialTraining) ++
-                       Array.fill[Double](num)(params.fracIncrementalUpdate)
+    val (initialStep, stepSize) = (numFeatures * params.fracInitialTraining,
+                                   numFeatures * params.fracIncrementalUpdate)
 
-    val trainSplits = training.randomSplit(splitWeights)
+    val shuffledFeatureIndices = Random.shuffle(Range(0, numFeatures).iterator).toArray
+    val(firstSplit, rest) = shuffledFeatureIndices.splitAt(initialStep.toInt)
+    val remainingSplits = rest.sliding(stepSize.toInt, stepSize.toInt)
+    val indicesArr = Array(firstSplit) ++ remainingSplits
+
+    import org.apache.spark.sql.functions._
+    val shuffleVector = udf { (v: Vector) =>
+      Vectors.dense(shuffledFeatureIndices.map(v.apply))
+    }
+
+    val test = initTest.withColumn("features", shuffleVector(initTest("features")))
+    val trainSplits = indicesArr.map { indices =>
+      val slicer = new VectorSlicer().setInputCol("features").setOutputCol("slicedFeatures")
+      slicer.setIndices(indices)
+      slicer.transform(training).select("label", "slicedFeatures",
+        "labelString").withColumnRenamed("slicedFeatures", "features")
+    }
+//    val trainSplits = indicesArr.map { indices =>
+//      val sliceToSparse = udf { (v: Vector) =>
+//        val vals = indices.map(v.apply)
+//        Vectors.sparse(indices.max + 1, indices, vals)
+//      }
+//      training.withColumn("features", sliceToSparse(training("features")))
+//    }
 
     // Set up Pipeline
     val stages = new mutable.ArrayBuffer[PipelineStage]()
@@ -283,6 +304,9 @@ object DecisionTreeExample {
     val pipeline = new Pipeline().setStages(stages.toArray)
 
     // Fit the Pipeline
+    val numFeaturesInSplit = trainSplits(0).select("features").first().getAs[Vector](0).size
+    println("Training DecisionTree model....")
+    println(s"numFeaturesInSplit = $numFeaturesInSplit")
     val startTime = System.nanoTime()
     val pipelineModel = pipeline.fit(trainSplits(0))
     val elapsedTime = (System.nanoTime() - startTime) / 1e9
@@ -324,18 +348,20 @@ object DecisionTreeExample {
     }
 
     trainSplits.drop(1).foreach { newFeatures =>
+      val numFeaturesInSplit = newFeatures.select("features").first().getAs[Vector](0).size
+      println("Updating model with additional features....")
+      println(s"numFeaturesInSplit = $numFeaturesInSplit")
+      val startTime = System.nanoTime()
       pipelineModel.update(newFeatures)
+      val elapsedTime = (System.nanoTime() - startTime) / 1e9
+      println(s"Training time: $elapsedTime seconds")
 
-      // Evaluate model on training, test data
+      // Evaluate model only on test data for subsequent training splits
       labelType match {
         case "classification" =>
-          println("Training data results:")
-          evaluateClassificationModel(pipelineModel, training, labelColName)
           println("Test data results:")
           evaluateClassificationModel(pipelineModel, test, labelColName)
         case "regression" =>
-          println("Training data results:")
-          evaluateRegressionModel(pipelineModel, training, labelColName)
           println("Test data results:")
           evaluateRegressionModel(pipelineModel, test, labelColName)
         case _ =>

@@ -95,6 +95,8 @@ final class DecisionTreeClassifier @Since("1.4.0") (
   /** @group getParam */
   def getAlgorithm: String = $(algorithm)
 
+  var model: DecisionTreeModel = null
+
   override protected def train(dataset: DataFrame): DecisionTreeClassificationModel = {
     val categoricalFeatures: Map[Int, Int] =
       MetadataUtils.getCategoricalFeatures(dataset.schema($(featuresCol)))
@@ -107,13 +109,36 @@ final class DecisionTreeClassifier @Since("1.4.0") (
     }
     val oldDataset: RDD[LabeledPoint] = extractLabeledPoints(dataset)
     val strategy = getOldStrategy(categoricalFeatures, numClasses)
-    val model = getAlgorithm match {
+    model = getAlgorithm match {
       case "byRow" =>
         val trees = RandomForest.run(oldDataset, strategy, numTrees = 1,
           featureSubsetStrategy = "all", seed = $(seed), parentUID = Some(uid))
         trees.head
       case "byCol" =>
         AltDT.train(oldDataset, strategy, parentUID = Some(uid))
+    }
+    model.asInstanceOf[DecisionTreeClassificationModel]
+  }
+
+  override def update(newFeatures: DataFrame, colsToRemove: Array[Int]):
+  DecisionTreeClassificationModel = {
+    val categoricalFeatures: Map[Int, Int] =
+      MetadataUtils.getCategoricalFeatures(newFeatures.schema($(featuresCol)))
+    val numClasses: Int = MetadataUtils.getNumClasses(newFeatures.schema($(labelCol))) match {
+      case Some(n: Int) => n
+      case None => throw new IllegalArgumentException("DecisionTreeClassifier was given input" +
+        s" with invalid label column ${$(labelCol)}, without the number of classes" +
+        " specified. See StringIndexer.")
+      // TODO: Automatically index labels: SPARK-7126
+    }
+    val newData: RDD[LabeledPoint] = extractLabeledPoints(newFeatures)
+    val strategy = getOldStrategy(categoricalFeatures, numClasses)
+    model = getAlgorithm match {
+      case "byCol" =>
+        AltDT.update(newData, colsToRemove, strategy)
+      case "byRow" =>
+        throw new IllegalArgumentException("update not supported for " +
+          "byRow yet!")
     }
     model.asInstanceOf[DecisionTreeClassificationModel]
   }

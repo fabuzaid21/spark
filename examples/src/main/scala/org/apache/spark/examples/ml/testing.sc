@@ -1,10 +1,13 @@
-import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.mllib.linalg.{Vectors, Vector, SparseVector}
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types.StringType
 import org.apache.spark.sql.{DataFrame, SQLContext}
 import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.ml.feature.VectorSlicer
+
+import scala.util.Random
 
 def loadData(
         sc: SparkContext,
@@ -72,6 +75,38 @@ def loadDatasets(
   (training, test)
 }
 
-val (training, test) = loadDatasets(sc, "data/10K_2K", "libsvm", "", "classification", 0.2)
+val (training, test) = loadDatasets(sc, "data/1700_500", "libsvm", "", "classification", 0.2)
+val numFeatures = 300
+val fracInitialTraining = 0.6
+val fracIncrementalUpdate = 0.1
 
+// import org.apache.spark.sql.functions._
+// val toSparse = udf((v: Vector) => v.toSparse)
+// val sparseTraining = training.withColumn("features", toSparse(training("features")))
+
+val (initialStep, stepSize) = (numFeatures * fracInitialTraining,
+  numFeatures * fracIncrementalUpdate)
+
+val shuffledFeatureIndices = Random.shuffle(Range(0, numFeatures).iterator).toArray
+val(firstSplit, rest) = shuffledFeatureIndices.splitAt(initialStep.toInt)
+val remainingSplits = rest.sliding(stepSize.toInt, stepSize.toInt)
+val indicesArr = Array(firstSplit) ++ remainingSplits
+import org.apache.spark.sql.functions._
+
+val trainSplits = indicesArr.map { indices =>
+  //      val slicer = new VectorSlicer().setInputCol("features").setOutputCol("slicedFeatures")
+  //      slicer.setIndices(indices)
+  //      val output = slicer.transform(sparseTraining)
+  val sliceToSparse = udf { (v: Vector) =>
+    val vals = indices.map(v.apply)
+    Vectors.sparse(indices.max + 1, indices, vals)
+  }
+  training.withColumn("features", sliceToSparse(training("features")))
+}
+
+// val splitWeights = Array(0.6, 0.1, 0.1, 0.1)
+// val trainSplits = training.randomSplit(splitWeights)
+// val slicer = new VectorSlicer().setInputCol("features").setOutputCol("reducedFeatures")
+// slicer.setIndices(Array(0, 1))
+// val output = slicer.transform(training)
 

@@ -148,7 +148,6 @@ private[tree] object TreeUtil {
       val columns = partitionColumns.map(Vectors.dense)
       columnIndices.zip(columns)
     }
-
     fullColumns
   }
 

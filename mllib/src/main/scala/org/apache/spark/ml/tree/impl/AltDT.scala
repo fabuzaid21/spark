@@ -362,9 +362,10 @@ private[ml] object AltDT extends Logging {
     // Initialize model.
     // Note: We do not use node indices.
     val rootNode = LearningNode.emptyNode(1) // TODO: remove node id
+    rootNode.offsets = (0, numRows)
+    var numNodeOffsets: Int = 2
     // Active nodes (still being split), updated each iteration
     var activeNodePeriphery: Array[LearningNode] = Array(rootNode)
-    var numNodeOffsets: Int = 2
 
     // Iteratively learn, one level of the tree at a time.
     var currentLevel = 0
@@ -390,26 +391,19 @@ private[ml] object AltDT extends Logging {
       doneLearning = currentLevel + 1 >= strategy.maxDepth || estimatedRemainingActive == 0
 
       if (!doneLearning) {
+//        val bitVectorMap = bestSplitsAndGains.map(_._3).filterNot(x => x.isEmpty)
+//        assert(bitVectorMap.length == activeNodePeriphery.length, s"bitVectorMap " +
+//          s"length ${bitVectorMap.length} should be equal to activeNodePeriphery " +
+//          s"length ${activeNodePeriphery.length}")
+
         // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right
-        val bitVectorMap = bestSplitsAndGains.map(_._3).filterNot(x => x.isEmpty)
-        assert(bitVectorMap.length == activeNodePeriphery.length, s"bitVectorMap " +
-          s"length ${bitVectorMap.length} should be equal to activeNodePeriphery " +
-          s"length ${activeNodePeriphery.length}")
-        val aggBitVector = bitVectorMap.reduce[RoaringBitmap] { (acc, bitv) =>
+        val aggBitVector = bestSplitsAndGains.map(_._3).reduce[RoaringBitmap] { (acc, bitv) =>
           acc.or(bitv)
           acc
         }
 
         partitionInfos = partitionInfos.map { partitionInfo =>
           partitionInfo.update(aggBitVector, numNodeOffsets)
-        }
-        val nodeOffsets = partitionInfos.first.nodeOffsets
-        var i = 0
-        while (i < activeNodePeriphery.length) {
-          val node = activeNodePeriphery(i)
-          node.offsets = (nodeOffsets(i), nodeOffsets(i + 1))
-          node.bitVectorSplit = bitVectorMap(i)
-          i += 1
         }
       }
       currentLevel += 1
@@ -563,16 +557,21 @@ private[ml] object AltDT extends Logging {
     bestSplitsAndGains.zipWithIndex.flatMap {
       case ((split, stats, bitv), nodeIdx) =>
         val node = oldPeriphery(nodeIdx)
-        if (split.nonEmpty && stats.gain > minInfoGain) {
+        val (from, to) = node.offsets
+        val numBitsSet = bitv.getCardinality
+        val numBitsNotSet = to - from - numBitsSet
+        if (split.nonEmpty && stats.gain > minInfoGain && numBitsSet != 0 && numBitsNotSet != 0) {
           // TODO: remove node id
-          node.leftChild = Some(LearningNode(node.id * 2, isLeaf = false,
+          // left child offsets: [from, numBitsNotSet)
+          node.leftChild = Some(LearningNode(node.id * 2, isLeaf = false, (from, numBitsNotSet),
             ImpurityStats(stats.leftImpurity, stats.leftImpurityCalculator)))
-          node.rightChild = Some(LearningNode(node.id * 2 + 1, isLeaf = false,
+          // right child offsets: [numBitsNotSet, to)
+          node.rightChild = Some(LearningNode(node.id * 2 + 1, isLeaf = false, (numBitsNotSet, to),
             ImpurityStats(stats.rightImpurity, stats.rightImpurityCalculator)))
+          node.bitVectorSplit = bitv
           node.split = split
           node.isLeaf = false
           node.stats = stats
-          node.offsets = null
           Iterator(node.leftChild.get, node.rightChild.get)
         } else {
           node.isLeaf = true
@@ -1161,7 +1160,7 @@ private[ml] object AltDT extends Logging {
           val oldOffset = newNodeOffsets(nodeIdx).head
           // numBitsNotSet == number of instances going to the left
           // which is how big the offset should be
-          // if numBitsNotSet == 0, then this node was not split,
+          // if numBitsNotSet == 0 || numBitsSet == 0, then this node was not split,
           // so we do not need to update its part of the column. Otherwise, we update it.
           if (numBitsNotSet == 0 || numBitsSet == 0) {
             newNodeOffsets(nodeIdx) = Array(oldOffset)
