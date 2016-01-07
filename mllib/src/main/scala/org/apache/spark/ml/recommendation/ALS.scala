@@ -38,7 +38,7 @@ import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util.{Identifiable, SchemaUtils}
 import org.apache.spark.mllib.optimization.NNLS
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.{Row, DataFrame}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DoubleType, FloatType, IntegerType, StructType}
 import org.apache.spark.storage.StorageLevel
@@ -321,7 +321,7 @@ class ALS(override val uid: String) extends Estimator[ALSModel] with ALSParams {
       .map { row =>
         Rating(row.getInt(0), row.getInt(1), row.getFloat(2))
       }
-    val (userFactors, itemFactors) = ALS.train(ratings, rank = $(rank),
+    val (userFactors, itemFactors) = ALS.train(this, uid, dataset, ratings, rank = $(rank),
       numUserBlocks = $(numUserBlocks), numItemBlocks = $(numItemBlocks),
       maxIter = $(maxIter), regParam = $(regParam), implicitPrefs = $(implicitPrefs),
       alpha = $(alpha), nonnegative = $(nonnegative),
@@ -520,6 +520,9 @@ object ALS extends Logging {
    */
   @DeveloperApi
   def train[ID: ClassTag]( // scalastyle:ignore
+      parent: Estimator[ALSModel],
+      uid: String,
+      trainingSet: DataFrame,
       ratings: RDD[Rating[ID]],
       rank: Int = 10,
       numUserBlocks: Int = 10,
@@ -604,26 +607,54 @@ object ALS extends Logging {
         }
         userFactors = computeFactors(itemFactors, itemOutBlocks, userInBlocks, rank, regParam,
           itemLocalIndexEncoder, solver = solver)
+
+
+        // BEGIN MODIFICATIONS
+        // 1) create RDDs for user factors matrix and item factors matrix
         val userIdAndFactors = userInBlocks
           .mapValues(_.srcIds)
           .join(userFactors)
           .mapPartitions({ items =>
             items.flatMap { case (_, (ids, factors)) =>
               ids.view.zip(factors)
-            }.map(x => (x._1, x._2.toList))
+            }
           }, preservesPartitioning = true)
-        userIdAndFactors.saveAsTextFile(s"userMatrix_${rank}_${iter}")
         val itemIdAndFactors = itemInBlocks
           .mapValues(_.srcIds)
           .join(itemFactors)
           .mapPartitions({ items =>
             items.flatMap { case (_, (ids, factors)) =>
               ids.view.zip(factors)
-            }.map(x => (x._1, x._2.toList))
+            }
           }, preservesPartitioning = true)
-        itemIdAndFactors.saveAsTextFile(s"itemMatrix_${rank}_${iter}")
+
+        // 2) create ALSModel to evaluate on training set
+        import trainingSet.sqlContext.implicits._
+        val model = new ALSModel(uid, rank, userIdAndFactors.toDF("id", "features"),
+          itemIdAndFactors.toDF("id", "features")).setParent(parent)
+        val predictions = model.transform(trainingSet).cache()
+        val mse = predictions.select("rating", "prediction").rdd
+          .flatMap { case Row(rating: Float, prediction: Float) =>
+            val err = rating.toDouble - prediction
+            val err2 = err * err
+            if (err2.isNaN) {
+              None
+            } else {
+              Some(err2)
+            }
+          }.mean()
+        val rmse = math.sqrt(mse)
+        // scalastyle:off println
+        println(s"Train RMSE, iteration $iter = $rmse.")
+        // scalastyle:on println
+
+        // 3) write user factors matrix and item factors matrix to text files
+        userIdAndFactors.map(x => (x._1, x._2.toList)).saveAsTextFile(s"userMatrix_${rank}_${iter}")
+        itemIdAndFactors.map(x => (x._1, x._2.toList)).saveAsTextFile(s"itemMatrix_${rank}_${iter}")
       }
+      // END MODIFICATIONS
     }
+
     val userIdAndFactors = userInBlocks
       .mapValues(_.srcIds)
       .join(userFactors)
