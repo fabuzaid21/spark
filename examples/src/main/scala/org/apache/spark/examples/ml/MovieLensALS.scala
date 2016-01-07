@@ -112,6 +112,7 @@ object MovieLensALS {
     val sqlContext = new SQLContext(sc)
     import sqlContext.implicits._
 
+    sc.setCheckpointDir("checkpoint")
     val ratings = sc.textFile(params.ratings).map(Rating.parseRating).cache()
 
     val numRatings = ratings.count()
@@ -122,7 +123,9 @@ object MovieLensALS {
 
     val splits = ratings.randomSplit(Array(0.8, 0.2), 0L)
     val training = splits(0).cache()
+    training.saveAsTextFile("training")
     val test = splits(1).cache()
+    test.saveAsTextFile("test")
 
     val numTraining = training.count()
     val numTest = test.count()

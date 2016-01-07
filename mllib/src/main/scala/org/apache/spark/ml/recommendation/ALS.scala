@@ -604,6 +604,24 @@ object ALS extends Logging {
         }
         userFactors = computeFactors(itemFactors, itemOutBlocks, userInBlocks, rank, regParam,
           itemLocalIndexEncoder, solver = solver)
+        val userIdAndFactors = userInBlocks
+          .mapValues(_.srcIds)
+          .join(userFactors)
+          .mapPartitions({ items =>
+            items.flatMap { case (_, (ids, factors)) =>
+              ids.view.zip(factors)
+            }.map(x => (x._1, x._2.toList))
+          }, preservesPartitioning = true)
+        userIdAndFactors.saveAsTextFile(s"userMatrix_${rank}_${iter}")
+        val itemIdAndFactors = itemInBlocks
+          .mapValues(_.srcIds)
+          .join(itemFactors)
+          .mapPartitions({ items =>
+            items.flatMap { case (_, (ids, factors)) =>
+              ids.view.zip(factors)
+            }.map(x => (x._1, x._2.toList))
+          }, preservesPartitioning = true)
+        itemIdAndFactors.saveAsTextFile(s"itemMatrix_${rank}_${iter}")
       }
     }
     val userIdAndFactors = userInBlocks
