@@ -236,7 +236,7 @@ class ALS private (
       this.numProductBlocks
     }
 
-    val (floatUserFactors, floatProdFactors) = NewALS.train[Int](
+    val (floatUserFactors, floatProdFactors) = NewALS.train[Int](null, null, null,
       ratings = ratings.map(r => NewALS.Rating(r.user, r.product, r.rating.toFloat)),
       rank = rank,
       numUserBlocks = numUserBlocks,

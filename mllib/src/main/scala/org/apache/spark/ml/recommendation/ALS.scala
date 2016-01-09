@@ -17,34 +17,33 @@
 
 package org.apache.spark.ml.recommendation
 
-import java.{util => ju}
 import java.io.IOException
+import java.{util => ju}
+
+import com.github.fommil.netlib.BLAS.{getInstance => blas}
+import com.github.fommil.netlib.LAPACK.{getInstance => lapack}
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.annotation.{DeveloperApi, Experimental}
+import org.apache.spark.ml.param._
+import org.apache.spark.ml.param.shared._
+import org.apache.spark.ml.util.{Identifiable, SchemaUtils}
+import org.apache.spark.ml.{Estimator, Model}
+import org.apache.spark.mllib.optimization.NNLS
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.{DoubleType, FloatType, IntegerType, StructType}
+import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.Utils
+import org.apache.spark.util.collection.{OpenHashMap, OpenHashSet, SortDataFormat, Sorter}
+import org.apache.spark.util.random.XORShiftRandom
+import org.apache.spark.{Logging, Partitioner}
+import org.netlib.util.intW
 
 import scala.collection.mutable
 import scala.reflect.ClassTag
 import scala.util.Sorting
 import scala.util.hashing.byteswap64
-
-import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import com.github.fommil.netlib.LAPACK.{getInstance => lapack}
-import org.apache.hadoop.fs.{FileSystem, Path}
-import org.netlib.util.intW
-
-import org.apache.spark.{Logging, Partitioner}
-import org.apache.spark.annotation.{DeveloperApi, Experimental}
-import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.ml.param._
-import org.apache.spark.ml.param.shared._
-import org.apache.spark.ml.util.{Identifiable, SchemaUtils}
-import org.apache.spark.mllib.optimization.NNLS
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{Row, DataFrame}
-import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{DoubleType, FloatType, IntegerType, StructType}
-import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.Utils
-import org.apache.spark.util.collection.{OpenHashMap, OpenHashSet, SortDataFormat, Sorter}
-import org.apache.spark.util.random.XORShiftRandom
 
 /**
  * Common params for ALS and ALSModel.
@@ -540,6 +539,8 @@ object ALS extends Logging {
     require(intermediateRDDStorageLevel != StorageLevel.NONE,
       "ALS is not designed to run without persisting intermediate RDDs.")
     val sc = ratings.sparkContext
+    import trainingSet.sqlContext.implicits._
+
     val userPart = new ALSPartitioner(numUserBlocks)
     val itemPart = new ALSPartitioner(numItemBlocks)
     val userLocalIndexEncoder = new LocalIndexEncoder(userPart.numPartitions)
@@ -629,10 +630,13 @@ object ALS extends Logging {
           }, preservesPartitioning = true)
 
         // 2) create ALSModel to evaluate on training set
-        import trainingSet.sqlContext.implicits._
-        val model = new ALSModel(uid, rank, userIdAndFactors.toDF("id", "features"),
-          itemIdAndFactors.toDF("id", "features")).setParent(parent)
-        val predictions = model.transform(trainingSet).cache()
+//        val userDF = trainingSet.sqlContext.createDataFrame(userIdAndFactors)
+//        val itemDF = trainingSet.sqlContext.createDataFrame(itemIdAndFactors)
+        val userDF = userIdAndFactors.toDF("id", "features")
+        val itemDF = itemIdAndFactors.toDF("id", "features")
+
+        val model = new ALSModel(uid, rank, userDF, itemDF).setParent(parent)
+        val predictions = model.transform(trainingSet)
         val mse = predictions.select("rating", "prediction").rdd
           .flatMap { case Row(rating: Float, prediction: Float) =>
             val err = rating.toDouble - prediction
