@@ -64,99 +64,151 @@ private[tree] object TreeUtil {
       return rowStore.sparkContext.parallelize(Seq.empty[(Int, Vector)])
     }
 
-    val numSourcePartitions = rowStore.partitions.length
-    val approxNumTargetPartitions = Math.min(numCols, numSourcePartitions)
-    val maxColumnsPerPartition = Math.ceil(numCols / approxNumTargetPartitions.toDouble).toInt
-    val numTargetPartitions = Math.ceil(numCols / maxColumnsPerPartition.toDouble).toInt
+    val byColAndRow = rowStore.zipWithIndex.flatMap { case (row: Vector, rowIndex: Long) =>
+      // var partitionIndex = 0
+      // var colsSoFar = 0
+      // var numColsInPartition = getNumColsInGroup(partitionIndex)
+      val buffer = new Array[(Int, (Int, Double))](row.size)
+      var colIndex = 0
+      // Note: we assume that the rows are Dense for now, so
+      // we iterate through each value one at a time
+      while (colIndex < row.size) {
+        val value = row(colIndex)
+        // if we've reached the number of columns for this
+        // partition, we move on to the next one
+        // if (colsSoFar == numColsInPartition) {
+        //   partitionIndex += 1
+        //   numColsInPartition = getNumColsInGroup(partitionIndex)
+        //   colsSoFar = 0
+        // }
 
-    def getNumColsInGroup(groupIndex: Int) = {
-      if (groupIndex + 1 < numTargetPartitions) {
-        maxColumnsPerPartition
-      } else {
-        numCols - (numTargetPartitions - 1) * maxColumnsPerPartition // last partition
+        // we can assume that rowIndex can be safely converted to an Int
+        buffer(colIndex) = (colIndex, (rowIndex.toInt, value))
+        // colsSoFar += 1
+        colIndex += 1
       }
+      buffer
     }
 
-    /* On each partition, re-organize into groups of columns:
-         (groupIndex, (sourcePartitionIndex, partCols)),
-         where partCols(colIdx) = partial column.
-       The groupIndex will be used to groupByKey.
-       The sourcePartitionIndex is used to ensure instance indices match up after the shuffle.
-       The partial columns will be stacked into full columns after the shuffle.
-       Note: By design, partCols will always have at least 1 column.
-     */
-    val partialColumns: RDD[(Int, (Int, Array[Array[Double]]))] =
-      rowStore.mapPartitionsWithIndex { case (sourcePartitionIndex, iterator) =>
-        // columnSets(groupIndex)(colIdx)
-        //   = column values for each instance in sourcePartitionIndex,
-        // where colIdx is a 0-based index for columns for groupIndex
-        val columnSets = new Array[Array[ArrayBuffer[Double]]](numTargetPartitions)
-        var groupIndex = 0
-        while(groupIndex < numTargetPartitions) {
-          columnSets(groupIndex) =
-            Array.fill[ArrayBuffer[Double]](getNumColsInGroup(groupIndex))(ArrayBuffer[Double]())
-          groupIndex += 1
+    val transpose = byColAndRow.groupByKey.mapPartitions({ partition =>
+      partition.map { case (colIndex, colIterator) =>
+        val col = new Array[Double](numRows)
+        colIterator.foreach { case (rowIndex, value) =>
+          col(rowIndex) = value
         }
-        while (iterator.hasNext) {
-          val row: Vector = iterator.next()
-          var groupIndex = 0
-          while (groupIndex < numTargetPartitions) {
-            val fromCol = groupIndex * maxColumnsPerPartition
-            val numColsInTargetPartition = getNumColsInGroup(groupIndex)
-            // TODO: match-case here on row as Dense or Sparse Vector (for speed)
-            var colIdx = 0
-            while (colIdx < numColsInTargetPartition) {
-              columnSets(groupIndex)(colIdx) += row(fromCol + colIdx)
-              colIdx += 1
-            }
-            groupIndex += 1
-          }
-        }
-        Range(0, numTargetPartitions).map { groupIndex =>
-          (groupIndex, (sourcePartitionIndex, columnSets(groupIndex).map(_.toArray)))
-        }.toIterator
+        (colIndex, Vectors.dense(col))
       }
+    }, preservesPartitioning = true)
+    transpose
 
-    // Shuffle data
-    val groupedPartialColumns: RDD[(Int, Iterable[(Int, Array[Array[Double]])])] =
-      partialColumns.groupByKey()
+//    val numSourcePartitions = rowStore.partitions.length
+//    val approxNumTargetPartitions = Math.min(numCols, numSourcePartitions)
+//    val maxColumnsPerPartition = Math.ceil(numCols / approxNumTargetPartitions.toDouble).toInt
+//    val numTargetPartitions = Math.ceil(numCols / maxColumnsPerPartition.toDouble).toInt
 
-    // Each target partition now holds its set of columns.
-    // Group the partial columns into full columns.
-    val fullColumns = groupedPartialColumns.flatMap { case (groupIndex, iterable) =>
-      // We do not know the number of rows per group, so we need to collect the groups
-      // before filling the full columns.
-      val collectedPartCols = new Array[Array[Array[Double]]](numSourcePartitions)
-      val iter = iterable.iterator
-      while (iter.hasNext) {
-        val (sourcePartitionIndex, partCols) = iter.next()
-        collectedPartCols(sourcePartitionIndex) = partCols
-      }
-      val rowOffsets: Array[Int] = collectedPartCols.map(_(0).length).scanLeft(0)(_ + _)
-      val numRows = rowOffsets.last
-      // Initialize full columns
-      val fromCol = groupIndex * maxColumnsPerPartition
-      val numColumnsInPartition = getNumColsInGroup(groupIndex)
-      val partitionColumns: Array[Array[Double]] =
-        Array.fill[Array[Double]](numColumnsInPartition)(new Array[Double](numRows))
-      var colIdx = 0 // index within group
-      while (colIdx < numColumnsInPartition) {
-        var sourcePartitionIndex = 0
-        while (sourcePartitionIndex < numSourcePartitions) {
-          val partColLength =
-            rowOffsets(sourcePartitionIndex + 1) - rowOffsets(sourcePartitionIndex)
-          Array.copy(collectedPartCols(sourcePartitionIndex)(colIdx), 0,
-            partitionColumns(colIdx), rowOffsets(sourcePartitionIndex), partColLength)
-          sourcePartitionIndex += 1
-        }
-        colIdx += 1
-      }
-      val columnIndices = Range(0, numColumnsInPartition).map(_ + fromCol)
-      val columns = partitionColumns.map(Vectors.dense)
-      columnIndices.zip(columns)
-    }
+//    def getNumColsInGroup(groupIndex: Int) = {
+//      if (groupIndex + 1 < numTargetPartitions) {
+//        maxColumnsPerPartition
+//      } else {
+//        numCols - (numTargetPartitions - 1) * maxColumnsPerPartition // last partition
+//      }
+//    }
 
-    fullColumns
+//    val rdd = rowStore.sparkContext.parallelize(Seq(Seq(1, 2, 3), Seq(4, 5, 6), Seq(7, 8, 9)))
+//    // Split the matrix into one number per line.
+//    val byColumnAndRow = rdd.zipWithIndex.flatMap {
+//      case (row, rowIndex) => row.zipWithIndex.map {
+//        case (number, columnIndex) => columnIndex -> (rowIndex, number)
+//      }
+//    }
+//
+//    // Build up the transposed matrix. Group and sort by column index first.
+//    val byColumn = byColumnAndRow.groupByKey.sortByKey().values
+//    // Then sort by row index.
+//    val transposed = byColumn.map {
+//      indexedRow => indexedRow.toSeq.sortBy(_._1).map(_._2)
+//    }
+
+//    /* On each partition, re-organize into groups of columns:
+//         (groupIndex, (sourcePartitionIndex, partCols)),
+//         where partCols(colIdx) = partial column.
+//       The groupIndex will be used to groupByKey.
+//       The sourcePartitionIndex is used to ensure instance indices match up after the shuffle.
+//       The partial columns will be stacked into full columns after the shuffle.
+//       Note: By design, partCols will always have at least 1 column.
+//     */
+//    val partialColumns: RDD[(Int, (Int, Array[Array[Double]]))] =
+//      rowStore.mapPartitionsWithIndex { case (sourcePartitionIndex, iterator) =>
+//        // columnSets(groupIndex)(colIdx)
+//        //   = column values for each instance in sourcePartitionIndex,
+//        // where colIdx is a 0-based index for columns for groupIndex
+//        val columnSets = new Array[Array[ArrayBuffer[Double]]](numTargetPartitions)
+//        var groupIndex = 0
+//        while(groupIndex < numTargetPartitions) {
+//          columnSets(groupIndex) =
+//            Array.fill[ArrayBuffer[Double]](getNumColsInGroup(groupIndex))(ArrayBuffer[Double]())
+//          groupIndex += 1
+//        }
+//        while (iterator.hasNext) {
+//          val row: Vector = iterator.next()
+//          var groupIndex = 0
+//          while (groupIndex < numTargetPartitions) {
+//            val fromCol = groupIndex * maxColumnsPerPartition
+//            val numColsInTargetPartition = getNumColsInGroup(groupIndex)
+//            // TODO: match-case here on row as Dense or Sparse Vector (for speed)
+//            var colIdx = 0
+//            while (colIdx < numColsInTargetPartition) {
+//              columnSets(groupIndex)(colIdx) += row(fromCol + colIdx)
+//              colIdx += 1
+//            }
+//            groupIndex += 1
+//          }
+//        }
+//        Range(0, numTargetPartitions).map { groupIndex =>
+//          (groupIndex, (sourcePartitionIndex, columnSets(groupIndex).map(_.toArray)))
+//        }.toIterator
+//      }
+//
+//    // Shuffle data
+//    val groupedPartialColumns: RDD[(Int, Iterable[(Int, Array[Array[Double]])])] =
+//      partialColumns.groupByKey()
+//
+//    // Each target partition now holds its set of columns.
+//    // Group the partial columns into full columns.
+//    val fullColumns = groupedPartialColumns.flatMap { case (groupIndex, iterable) =>
+//      // We do not know the number of rows per group, so we need to collect the groups
+//      // before filling the full columns.
+//      val collectedPartCols = new Array[Array[Array[Double]]](numSourcePartitions)
+//      val iter = iterable.iterator
+//      while (iter.hasNext) {
+//        val (sourcePartitionIndex, partCols) = iter.next()
+//        collectedPartCols(sourcePartitionIndex) = partCols
+//      }
+//      val rowOffsets: Array[Int] = collectedPartCols.map(_(0).length).scanLeft(0)(_ + _)
+//      val numRows = rowOffsets.last
+//      // Initialize full columns
+//      val fromCol = groupIndex * maxColumnsPerPartition
+//      val numColumnsInPartition = getNumColsInGroup(groupIndex)
+//      val partitionColumns: Array[Array[Double]] =
+//        Array.fill[Array[Double]](numColumnsInPartition)(new Array[Double](numRows))
+//      var colIdx = 0 // index within group
+//      while (colIdx < numColumnsInPartition) {
+//        var sourcePartitionIndex = 0
+//        while (sourcePartitionIndex < numSourcePartitions) {
+//          val partColLength =
+//            rowOffsets(sourcePartitionIndex + 1) - rowOffsets(sourcePartitionIndex)
+//          Array.copy(collectedPartCols(sourcePartitionIndex)(colIdx), 0,
+//            partitionColumns(colIdx), rowOffsets(sourcePartitionIndex), partColLength)
+//          sourcePartitionIndex += 1
+//        }
+//        colIdx += 1
+//      }
+//      val columnIndices = Range(0, numColumnsInPartition).map(_ + fromCol)
+//      val columns = partitionColumns.map(Vectors.dense)
+//      columnIndices.zip(columns)
+//    }
+//
+//    fullColumns
   }
 
   /**
