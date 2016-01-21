@@ -779,7 +779,10 @@ private[ml] object AltDT extends Logging {
         featureIndex: Int,
         featureArity: Int,
         featureVector: Vector): FeatureVector = {
-      val (values, indices) = featureVector.toArray.zipWithIndex.sorted.unzip
+      val values = featureVector.toArray
+      val indices = values.indices.toArray
+      DualPivotQuicksort.sort(values, indices)
+//      val (values, indices) = featureVector.toArray.zipWithIndex.sorted.unzip
       new FeatureVector(featureIndex, featureArity, values.toArray, indices.toArray)
     }
   }
