@@ -942,12 +942,12 @@ private[ml] object AltDT extends Logging {
             }
             // END SORTING
 
-            // update the column values and indices
-            // with the corresponding indices
-            Array.copy(tempVals, from, col.values, from, rangeValues.length)
-            Array.copy(tempIndices, from, col.indices, from, rangeValues.length)
           }
         }
+        // update the column values and indices
+        // with the corresponding indices
+        Array.copy(tempVals, 0, col.values, 0, col.values.length)
+        Array.copy(tempIndices, 0, col.indices, 0, col.values.length)
         col
       }
 
