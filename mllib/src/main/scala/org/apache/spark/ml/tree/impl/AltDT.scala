@@ -280,12 +280,18 @@ private[ml] object AltDT extends Logging {
 
     // Aggregate best split for each active node.
     partBestSplitsAndGains.treeReduce { case (splitsGains1, splitsGains2) =>
-      splitsGains1.zip(splitsGains2).map { case ((split1, gain1), (split2, gain2)) =>
-        if (gain1.gain >= gain2.gain) {
-          (split1, gain1)
-        } else {
-          (split2, gain2)
+      var i = 0
+      splitsGains1.map { case (split1, gain1) =>
+        val (split2, gain2) = splitsGains2(i)
+        val bestSplit = {
+          if (gain1.gain >= gain2.gain) {
+            (split1, gain1)
+          } else {
+            (split2, gain2)
+          }
         }
+        i += 1
+        bestSplit
       }
     }
   }
@@ -304,9 +310,10 @@ private[ml] object AltDT extends Logging {
       oldPeriphery: Array[LearningNode],
       bestSplitsAndGains: Array[(Option[Split], ImpurityStats)],
       minInfoGain: Double): Array[LearningNode] = {
-    bestSplitsAndGains.zipWithIndex.flatMap {
-      case ((split, stats), nodeIdx) =>
-        val node = oldPeriphery(nodeIdx)
+    var nodeIdx = 0
+    bestSplitsAndGains.flatMap { case (split, stats) =>
+      val node = oldPeriphery(nodeIdx)
+      val result = {
         if (split.nonEmpty && stats.gain > minInfoGain) {
           // TODO: remove node id
           node.leftChild = Some(LearningNode(node.id * 2, isLeaf = false,
@@ -321,6 +328,9 @@ private[ml] object AltDT extends Logging {
           node.isLeaf = true
           Iterator()
         }
+      }
+      nodeIdx += 1
+      result
     }
   }
 
@@ -347,23 +357,27 @@ private[ml] object AltDT extends Logging {
         val localBestSplits: Array[Option[Split]] = bestSplitsBc.value
         // localFeatureIndex[feature index] = index into PartitionInfo.columns
         val localFeatureIndex: Map[Int, Int] = columns.map(_.featureIndex).zipWithIndex.toMap
-        val bitSetForNodes: Iterator[RoaringBitmap] = activeNodes.iterator
-          .zip(localBestSplits.iterator).flatMap {
-          case (nodeIndexInLevel: Int, Some(split: Split)) =>
-            if (localFeatureIndex.contains(split.featureIndex)) {
-              // This partition has the column (feature) used for this split.
-              val fromOffset = nodeOffsets(nodeIndexInLevel)
-              val toOffset = nodeOffsets(nodeIndexInLevel + 1)
-              val colIndex: Int = localFeatureIndex(split.featureIndex)
-              Iterator(bitVectorFromSplit(columns(colIndex), fromOffset, toOffset, split, numRows))
-            } else {
+        var i = 0
+        val bitSetForNodes: Iterator[RoaringBitmap] = activeNodes.iterator.flatMap { nodeIdx =>
+          val iter = localBestSplits(i) match {
+            case Some(split) =>
+              if (localFeatureIndex.contains(split.featureIndex)) {
+                // This partition has the column (feature) used for this split.
+                val from = nodeOffsets(nodeIdx)
+                val to = nodeOffsets(nodeIdx + 1)
+                val colIndex: Int = localFeatureIndex(split.featureIndex)
+                Iterator(bitVectorFromSplit(columns(colIndex), from, to, split, numRows))
+              } else {
+                Iterator()
+              }
+            case None =>
+              // Do not create a bitVector when there is no split.
+              // PartitionInfo.update will detect that there is no
+              // split, by how many instances go left/right.
               Iterator()
-            }
-          case (nodeIndexInLevel: Int, None) =>
-            // Do not create a bitVector when there is no split.
-            // PartitionInfo.update will detect that there is no
-            // split, by how many instances go left/right.
-            Iterator()
+          }
+          i += 1
+          iter
         }
         if (bitSetForNodes.isEmpty) {
           new RoaringBitmap()
@@ -575,9 +589,13 @@ private[ml] object AltDT extends Logging {
     // Label stats for each category
     val aggStats = Array.tabulate[ImpurityAggregatorSingle](featureArity)(
       _ => metadata.createImpurityAggregator())
-    values.zip(labels).foreach { case (cat, label) =>
+    var i = 0
+    while (i < values.length) {
+      val cat = values(i)
+      val label = labels(i)
       // NOTE: we assume the values for categorical features are Ints in [0,featureArity)
       aggStats(cat.toInt).update(label)
+      i += 1
     }
 
     // Aggregated statistics for left part of split and entire split.
