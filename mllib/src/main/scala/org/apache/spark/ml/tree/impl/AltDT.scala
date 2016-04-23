@@ -17,11 +17,13 @@
 
 package org.apache.spark.ml.tree.impl
 
+import java.util.{HashMap => JavaHashMap}
+
 import org.apache.spark.Logging
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.tree._
 import org.apache.spark.ml.tree.impl.TreeUtil._
-import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.mllib.linalg.{DenseVector, SparseVector, Vector}
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.configuration.Strategy
 import org.apache.spark.mllib.tree.impl.DecisionTreeMetadata
@@ -182,7 +184,7 @@ private[ml] object AltDT extends Logging {
     // Sort each column by feature values.
     val colStore: RDD[FeatureVector] = colStoreInit.map { case (featureIndex: Int, col: Vector) =>
       val featureArity: Int = strategy.categoricalFeaturesInfo.getOrElse(featureIndex, 0)
-      FeatureVector.fromOriginal(featureIndex, featureArity, col)
+      FeatureVector.fromOriginal(featureIndex, featureArity, col, labelsBc.value)
     }
     // Group columns together into one array of columns per partition.
     // TODO: Test avoiding this grouping, and see if it matters.
@@ -302,7 +304,7 @@ private[ml] object AltDT extends Logging {
           val toOffset = nodeOffsets(nodeIndexInLevel + 1)
           val splitsAndStats =
             columns.map { col =>
-              chooseSplit(col, localLabels, fromOffset, toOffset, metadata)
+              chooseSplit(col, localLabels, fromOffset, toOffset, nodeIndexInLevel, metadata)
             }
           toReturn(i) = splitsAndStats.maxBy(_._2.gain)
           i += 1
@@ -411,6 +413,117 @@ private[ml] object AltDT extends Logging {
     aggBitVector
   }
 
+  def chooseSparseContinuousSplit(featureIndex: Int, values: Array[Double], indices: Array[Int],
+                                  labels: Array[Double], from: Int, to: Int, zeroMap: JavaHashMap[Double, Int],
+                                  metadata: AltDTMetadata): (Option[Split], ImpurityStats) = {
+    val leftImpurityAgg = metadata.createImpurityAggregator()
+    val rightImpurityAgg = metadata.createImpurityAggregator()
+
+    var i = from
+    while (i < to) {
+      rightImpurityAgg.update(labels(indices(i)), 1.0)  // can we pass each label once with a weight equal to count?
+      i += 1
+    }
+    zeroMap.forEach { case(label, freq) =>
+      rightImpurityAgg.update(label, freq)
+    }
+
+    var bestThreshold: Double = Double.NegativeInfinity
+    val bestLeftImpurityAgg = leftImpurityAgg.deepCopy()
+    var bestGain: Double = 0.0
+    val fullImpurity = rightImpurityAgg.getCalculator.calculate()
+    var leftCount: Double = 0.0
+    var rightCount: Double = rightImpurityAgg.getCount
+    val fullCount: Double = rightCount
+    var currentThreshold = if(values.length > from) values(from) else bestThreshold
+    var j = from + 1
+    // columns are sorted in ascending order, check all values less than 0
+    while (j < to && values(j) < 0) {
+      val value = values(j)
+      val label = labels(indices(j))
+      if (value != currentThreshold) {
+        // Check gain
+        val leftWeight = leftCount / fullCount
+        val rightWeight = rightCount / fullCount
+        val leftImpurity = leftImpurityAgg.getCalculator.calculate()
+        val rightImpurity = rightImpurityAgg.getCalculator.calculate()
+        val gain = fullImpurity - leftWeight * leftImpurity - rightWeight * rightImpurity
+        if (leftCount != 0 && rightCount != 0 && gain > bestGain && gain > metadata.minInfoGain) {
+          bestThreshold = currentThreshold
+          System.arraycopy(leftImpurityAgg.stats, 0, bestLeftImpurityAgg.stats, 0, leftImpurityAgg.stats.length)
+          bestGain = gain
+        }
+        currentThreshold = value
+      }
+
+      // Move this instance from right to left side of split.
+      leftImpurityAgg.update(label, 1.0)
+      rightImpurityAgg.update(label, -1.0)
+      leftCount += 1.0
+      rightCount -= 1.0
+      j += 1
+    }
+
+    // check gain for 0 values
+    val leftWeight = leftCount / fullCount
+    val rightWeight = rightCount / fullCount
+    val leftImpurity = leftImpurityAgg.getCalculator.calculate()
+    val rightImpurity = rightImpurityAgg.getCalculator.calculate()
+    val gain = fullImpurity - leftWeight * leftImpurity - rightWeight * rightImpurity
+    if (leftCount != 0 && rightCount != 0 && gain > bestGain && gain > metadata.minInfoGain) {
+      bestThreshold = currentThreshold
+      System.arraycopy(leftImpurityAgg.stats, 0, bestLeftImpurityAgg.stats, 0, leftImpurityAgg.stats.length)
+      bestGain = gain
+    }
+    currentThreshold = 0
+
+    // Move the zero instances from right to left side of split.
+    zeroMap.forEach { case(label, freq) =>
+      leftImpurityAgg.update(label, freq)
+      rightImpurityAgg.update(label, -1*freq)
+      leftCount += freq
+      rightCount -= freq
+    }
+
+    // continue checking values greater than 0
+    while (j < to) {
+      val value = values(j)
+      val label = labels(indices(j))
+      if (value != currentThreshold) {
+        // Check gain
+        val leftWeight = leftCount / fullCount
+        val rightWeight = rightCount / fullCount
+        val leftImpurity = leftImpurityAgg.getCalculator.calculate()
+        val rightImpurity = rightImpurityAgg.getCalculator.calculate()
+        val gain = fullImpurity - leftWeight * leftImpurity - rightWeight * rightImpurity
+        if (leftCount != 0 && rightCount != 0 && gain > bestGain && gain > metadata.minInfoGain) {
+          bestThreshold = currentThreshold
+          System.arraycopy(leftImpurityAgg.stats, 0, bestLeftImpurityAgg.stats, 0, leftImpurityAgg.stats.length)
+          bestGain = gain
+        }
+        currentThreshold = value
+      }
+
+      // Move this instance from right to left side of split.
+      leftImpurityAgg.update(label, 1.0)
+      rightImpurityAgg.update(label, -1.0)
+      leftCount += 1.0
+      rightCount -= 1.0
+      j += 1
+    }
+
+    val fullImpurityAgg = leftImpurityAgg.deepCopy().add(rightImpurityAgg)
+    val bestRightImpurityAgg = fullImpurityAgg.deepCopy().subtract(bestLeftImpurityAgg)
+    val bestImpurityStats = new ImpurityStats(bestGain, fullImpurity, fullImpurityAgg.getCalculator,
+      bestLeftImpurityAgg.getCalculator, bestRightImpurityAgg.getCalculator)
+    val split = if (bestThreshold != Double.NegativeInfinity && bestThreshold != values.last) {
+      Some(new ContinuousSplit(featureIndex, bestThreshold))
+    } else {
+      None
+    }
+    (split, bestImpurityStats)
+  }
+
   /**
    * Choose the best split for a feature at a node.
    * TODO: Return null or None when the split is invalid, such as putting all instances on one
@@ -424,6 +537,7 @@ private[ml] object AltDT extends Logging {
       labels: Array[Double],
       fromOffset: Int,
       toOffset: Int,
+      nodeIndex: Int,
       metadata: AltDTMetadata): (Option[Split], ImpurityStats) = {
     if (col.isCategorical) {
       if (metadata.isUnorderedFeature(col.featureIndex)) {
@@ -435,7 +549,12 @@ private[ml] object AltDT extends Logging {
           metadata, col.featureArity)
       }
     } else {
-      chooseContinuousSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset, metadata)
+      if (col.isSparse) {
+        chooseSparseContinuousSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
+          col.zeroMaps(nodeIndex), metadata)
+      } else {
+        chooseContinuousSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset, metadata)
+      }
     }
   }
 
@@ -952,10 +1071,13 @@ private[ml] object AltDT extends Logging {
                                      val featureIndex: Int,
                                      val featureArity: Int,
                                      val values: Array[Double],
-                                     val indices: Array[Int])
-    extends Serializable {
+                                     val indices: Array[Int],
+                                     val zeroMaps: Array[JavaHashMap[Double, Int]],
+                                     val size: Int) extends Serializable {
 
     def isCategorical: Boolean = featureArity > 0
+
+     def isSparse: Boolean = zeroMaps.length > 0
 
     /** For debugging */
     override def toString: String = {
@@ -965,11 +1087,13 @@ private[ml] object AltDT extends Logging {
         s"    featureArity: $featureArity,\n" +
         s"    values: ${values.mkString(", ")},\n" +
         s"    indices: ${indices.mkString(", ")},\n" +
+        s"    zeroMaps: ${zeroMaps.mkString(", ")},\n" +
         "  )"
     }
 
     def deepCopy(): FeatureVector =
-      new FeatureVector(featureIndex, featureArity, values.clone(), indices.clone())
+      new FeatureVector(featureIndex, featureArity, values.clone(), indices.clone(),
+        zeroMaps.clone(), size)
 
     override def equals(other: Any): Boolean = {
       other match {
@@ -986,11 +1110,43 @@ private[ml] object AltDT extends Logging {
     def fromOriginal(
                       featureIndex: Int,
                       featureArity: Int,
-                      featureVector: Vector): FeatureVector = {
-      val values = featureVector.toArray
-      val indices = values.indices.toArray
-      val fv = new FeatureVector(featureIndex, featureArity, values, indices)
-      val sorter = new Sorter(new FeatureVectorSortByValue(featureIndex, featureArity))
+                      feature: Vector,
+                      labels: Array[Double]): FeatureVector = {
+
+      val values = feature match {
+        case v: DenseVector => feature.toArray
+        case v: SparseVector => v.values
+      }
+
+      val indices = feature match {
+        case v: DenseVector => values.indices.toArray
+        case v: SparseVector => v.indices
+      }
+
+      val zeroMaps: Array[JavaHashMap[Double, Int]] = feature match {
+        case dv: DenseVector => Array.empty[JavaHashMap[Double, Int]]
+        case sv: SparseVector =>
+          val map = new JavaHashMap[Double, Int]()
+          val inds = sv.indices.toIterator ++ Iterator(sv.size)
+          var prev = 0
+          var idx = 0
+          var next = 0
+          while (inds.hasNext) {
+            next = inds.next()
+            while (prev < next) {
+              val label = labels(prev)
+              val freq = if (map.containsKey(label)) map.get(label) else 0
+              map.put(label, freq + 1)
+              prev += 1
+            }
+            prev = next + 1
+            idx += 1
+          }
+          Array(map)
+      }
+
+      val fv = new FeatureVector(featureIndex, featureArity, values, indices, zeroMaps, feature.size)
+      val sorter = new Sorter(new FeatureVectorSortByValue(featureIndex, featureArity, zeroMaps, feature.size))
       sorter.sort(fv, 0, values.length, Ordering[KeyWrapper[Double]])
       fv
     }
@@ -1002,7 +1158,11 @@ private[ml] object AltDT extends Logging {
     *                     FeatureVector is allocated during sorting, that new object
     *                     also has the same featureIndex and featureArity
     */
-  private class FeatureVectorSortByValue(featureIndex: Int, featureArity: Int)(implicit ord: Ordering[Double])
+  private class FeatureVectorSortByValue(
+                                          featureIndex: Int,
+                                          featureArity: Int,
+                                          zeroMaps: Array[JavaHashMap[Double, Int]],
+                                          size: Int)(implicit ord: Ordering[Double])
     extends SortDataFormat[KeyWrapper[Double], FeatureVector] {
 
     override def newKey(): KeyWrapper[Double] = new KeyWrapper()
@@ -1045,7 +1205,8 @@ private[ml] object AltDT extends Logging {
     }
 
     override def allocate(length: Int): FeatureVector = {
-      new FeatureVector(featureIndex, featureArity, new Array[Double](length), new Array[Int](length))
+      new FeatureVector(featureIndex, featureArity, new Array[Double](length),
+                        new Array[Int](length), zeroMaps, size)
     }
 
     override def copyElement(src: FeatureVector,
