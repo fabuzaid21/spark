@@ -154,7 +154,8 @@ object TreeUtil {
         colIdx += 1
       }
       val columnIndices = Range(0, numColumnsInPartition).map(_ + fromCol)
-      val columns = partitionColumns.map(Vectors.dense)
+//      val columns = partitionColumns.map(Vectors.dense)
+      val columns = partitionColumns.map(arr => Vectors.dense(arr).compressed)
       columnIndices.zip(columns)
     }
 

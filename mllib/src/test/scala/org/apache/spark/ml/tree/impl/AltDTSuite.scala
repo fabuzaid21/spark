@@ -19,13 +19,13 @@ package org.apache.spark.ml.tree.impl
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.ml.regression.DecisionTreeRegressor
-import org.apache.spark.ml.tree._
-import org.apache.spark.ml.tree.impl.AltDT.{AltDTMetadata, FeatureVector, PartitionInfo}
+import org.apache.spark.ml.tree.impl.AltDT.{PartitionInfo, AltDTMetadata}
+import org.apache.spark.ml.tree.{LeafNode, InternalNode}
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.tree.impurity._
-import org.apache.spark.mllib.tree.model.ImpurityStats
+import org.apache.spark.mllib.tree.impurity.Entropy
 import org.apache.spark.mllib.util.MLlibTestSparkContext
+import org.apache.spark.ml.tree.impl.FeatureVector._
 import org.apache.spark.util.collection.BitSet
 import org.roaringbitmap.RoaringBitmap
 
@@ -116,14 +116,15 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
   /* * * * * * * * * * * Helper classes * * * * * * * * * * */
 
   test("FeatureVector") {
-    val v = new FeatureVector(1, 0, Array(0.1, 0.3, 0.7), Array(1, 2, 0))
+    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map.empty[Int, Int])
+    val v = createUnsortedVector(1, 0, Array(0.1, 0.3, 0.7), Array(1, 2, 0), metadata)
 
     val vCopy = v.deepCopy()
     vCopy.values(0) = 1000
     assert(v.values(0) !== vCopy.values(0))
 
     val original = Vectors.dense(0.7, 0.1, 0.3)
-    val v2 = FeatureVector.fromOriginal(1, 0, original)
+    val v2 = FeatureVector.fromOriginal(1, 0, original, metadata)
     assert(v === v2)
   }
 
@@ -135,20 +136,22 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val fvUnsorted = Vectors.dense(col)
     val featureIndex = 3
     val featureArity = 0
+    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map.empty[Int, Int])
+
     val fvSorted =
-      FeatureVector.fromOriginal(featureIndex, featureArity, fvUnsorted)
+      FeatureVector.fromOriginal(featureIndex, featureArity, fvUnsorted, metadata)
     assert(fvSorted.featureIndex === featureIndex)
-    assert(fvSorted.featureArity === featureArity)
     assert(fvSorted.values.deep === values.deep)
     assert(fvSorted.indices.deep === sortedIndices.deep)
   }
 
   test("PartitionInfo") {
+    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map(1 -> 3))
     val numRows = 4
     val col1 =
-      FeatureVector.fromOriginal(0, 0, Vectors.dense(0.8, 0.2, 0.1, 0.6))
+      FeatureVector.fromOriginal(0, 0, Vectors.dense(0.8, 0.2, 0.1, 0.6), metadata)
     val col2 =
-      FeatureVector.fromOriginal(1, 3, Vectors.dense(0, 1, 0, 2))
+      FeatureVector.fromOriginal(1, 3, Vectors.dense(0, 1, 0, 2), metadata)
     assert(col1.values.length === numRows)
     assert(col2.values.length === numRows)
     val nodeOffsets = Array(0, numRows)
@@ -168,9 +171,9 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
 
     assert(newInfo.columns.length === 2)
     val expectedCol1a =
-      new FeatureVector(0, 0, Array(0.1, 0.8, 0.2, 0.6), Array(2, 0, 1, 3))
+      createUnsortedVector(0, 0, Array(0.1, 0.8, 0.2, 0.6), Array(2, 0, 1, 3), metadata)
     val expectedCol1b =
-      new FeatureVector(1, 3, Array(0, 0, 1, 2), Array(0, 2, 1, 3))
+      createUnsortedVector(1, 3, Array(0, 0, 1, 2), Array(0, 2, 1, 3), metadata)
     assert(newInfo.columns(0) === expectedCol1a)
     assert(newInfo.columns(1) === expectedCol1b)
     assert(newInfo.nodeOffsets === Array(0, 2, 4))
@@ -185,319 +188,391 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
 
     assert(newInfo2.columns.length === 2)
     val expectedCol2a =
-      new FeatureVector(0, 0, Array(0.8, 0.1, 0.2, 0.6), Array(0, 2, 1, 3))
+      createUnsortedVector(0, 0, Array(0.8, 0.1, 0.2, 0.6), Array(0, 2, 1, 3), metadata)
     val expectedCol2b =
-      new FeatureVector(1, 3, Array(0, 0, 1, 2), Array(0, 2, 1, 3))
+      createUnsortedVector(1, 3, Array(0, 0, 1, 2), Array(0, 2, 1, 3), metadata)
     assert(newInfo2.columns(0) === expectedCol2a)
     assert(newInfo2.columns(1) === expectedCol2b)
     assert(newInfo2.nodeOffsets === Array(0, 1, 2, 3, 4))
     assert(newInfo2.activeNodes.iterator.toSet === Set(0, 1, 2, 3))
   }
 
+  /* * * * * * * * * * * Delta Encoding  * * * * * * * * * * */
+  test("Delta encoding") {
+    val arr = Array(1.75, 2.0, 0.0, 2.0, 0.5, 0.1, 3.0)
+    val sorted = arr.sorted
+    val delta = FeatureVector.deltaEncoding(sorted)
+    assert(delta.sameElements(
+        Array(
+          0.0, 0.1, 0.4, 1.25, 0.25, 0.0, 1.0
+        )
+      )
+    )
+
+    val arr2 = Array(1.0, 2.0, 4.0, 6.0, -1.0, 9.0, 3.0)
+    val sorted2 = arr2.sorted
+    val delta2 = FeatureVector.deltaEncoding(sorted2)
+    assert(delta2.sameElements(
+      Array(
+        -1.0, 2.0, 1.0, 1.0, 1.0, 2.0, 3.0
+      )
+    )
+    )
+  }
+
+  /* * * * * * * * * * * Run-length Encoding  * * * * * * * * * * */
+  test("Run-length encoding") {
+    val arr = Array(1.0, 2.0, 0.0, 2.0, 0.0, 0.0, 3.0)
+    val sorted = arr.sorted
+    val rle = FeatureVector.runLengthEncoding(sorted)
+    assert(rle.sameElements(
+        Array(
+          (0.0,3),(1.0,1),(2.0,2),(3.0,1)
+        )
+      )
+    )
+
+    val arr2 = Array(1.0, 2.0, 4.0, 6.0, -1.0, 9.0, 3.0)
+    val sorted2 = arr2.sorted
+    val rle2 = FeatureVector.runLengthEncoding(sorted2)
+    assert(rle2.sameElements(
+        Array(
+          (-1.0,1),(1.0,1),(2.0,1),(3.0,1),
+          (4.0,1),(6.0,1),(9.0,1)
+        )
+      )
+    )
+
+    val arr3 = Array(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    val sorted3 = arr3.sorted
+    val rle3 = FeatureVector.runLengthEncoding(sorted3)
+    assert(rle3.sameElements(
+        Array(
+          (1.0,7)
+        )
+      )
+    )
+
+    val arr4 = Array(1.0, 4.0, 4.0, 9.0, 6.0, -1.0, 9.0, 1.0)
+    val sorted4 = arr4.sorted
+    val rle4 = FeatureVector.runLengthEncoding(sorted4)
+    assert(rle4.sameElements(
+        Array(
+          (-1.0,1),(1.0,2),(4.0,2),(6.0,1),(9.0,2)
+        )
+      )
+    )
+
+  }
+
   /* * * * * * * * * * * Misc  * * * * * * * * * * */
 
-  test("numUnorderedBins") {
-    // Note: We have duplicate bins (the inverse) for unordered features.  This should be fixed!
-    assert(AltDT.numUnorderedBins(2) === 2)  // 2 categories => 2 bins
-    assert(AltDT.numUnorderedBins(3) === 6)  // 3 categories => 6 bins
-  }
-
-  /* * * * * * * * * * * Choosing Splits  * * * * * * * * * * */
-
-  test("computeBestSplits") {
-    // TODO
-  }
-
-  test("chooseSplit: choose correct type of split") {
-    val labels = Seq(0, 0, 0, 1, 1, 1, 1).map(_.toDouble).toArray
-    val fromOffset = 1
-    val toOffset = 4
-    val impurity = Entropy
-    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map(1 -> 3))
-
-    val col1 = FeatureVector.fromOriginal(featureIndex = 0, featureArity = 0,
-      featureVector = Vectors.dense(0.8, 0.1, 0.1, 0.2, 0.3, 0.5, 0.6))
-    val (split1, _) = AltDT.chooseSplit(col1, labels, fromOffset, toOffset, metadata)
-    assert(split1.nonEmpty && split1.get.isInstanceOf[ContinuousSplit])
-
-    val col2 = FeatureVector.fromOriginal(featureIndex = 1, featureArity = 3,
-      featureVector = Vectors.dense(0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0))
-    val (split2, _) = AltDT.chooseSplit(col2, labels, fromOffset, toOffset, metadata)
-    assert(split2.nonEmpty && split2.get.isInstanceOf[CategoricalSplit])
-  }
-
-  test("chooseOrderedCategoricalSplit: basic case") {
-    val featureIndex = 0
-    val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
-    val featureArity = values.max.toInt + 1
-
-    def testHelper(
-        labels: Array[Double],
-        expectedLeftCategories: Array[Double],
-        expectedLeftStats: Array[Double],
-        expectedRightStats: Array[Double]): Unit = {
-      val expectedRightCategories = Range(0, featureArity)
-        .filter(c => !expectedLeftCategories.contains(c)).map(_.toDouble).toArray
-      val impurity = Entropy
-      val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0,
-        impurity, Map.empty[Int, Int])
-      val (split, stats) =
-        AltDT.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray, labels, 0,
-          values.length, metadata, featureArity)
-      split match {
-        case Some(s: CategoricalSplit) =>
-          assert(s.featureIndex === featureIndex)
-          assert(s.leftCategories === expectedLeftCategories)
-          assert(s.rightCategories === expectedRightCategories)
-        case _ =>
-          throw new AssertionError(
-            s"Expected CategoricalSplit but got ${split.getClass.getSimpleName}")
-      }
-      val fullImpurityStatsArray =
-        Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-      val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
-      assert(stats.gain === fullImpurity)
-      assert(stats.impurity === fullImpurity)
-      assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
-      assert(stats.leftImpurityCalculator.stats === expectedLeftStats)
-      assert(stats.rightImpurityCalculator.stats === expectedRightStats)
-      assert(stats.valid)
-    }
-
-    val labels1 = Array(0, 0, 1, 1, 1, 1, 1).map(_.toDouble)
-    testHelper(labels1, Array(0.0), Array(2.0, 0.0), Array(0.0, 5.0))
-
-    val labels2 = Array(0, 0, 0, 1, 1, 1, 1).map(_.toDouble)
-    testHelper(labels2, Array(0.0, 1.0), Array(3.0, 0.0), Array(0.0, 4.0))
-  }
-
-  test("chooseOrderedCategoricalSplit: return bad split if we should not split") {
-    val featureIndex = 0
-    val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
-    val featureArity = values.max.toInt + 1
-
-    val labels = Array(1, 1, 1, 1, 1, 1, 1).map(_.toDouble)
-
-    val impurity = Entropy
-    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
-      Map(featureIndex -> featureArity))
-    val (split, stats) =
-      AltDT.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray, labels, 0,
-        values.length, metadata, featureArity)
-    assert(split.isEmpty)
-    val fullImpurityStatsArray =
-      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
-    assert(stats.gain === 0.0)
-    assert(stats.impurity === fullImpurity)
-    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
-    assert(stats.valid)
-  }
-
-  test("chooseUnorderedCategoricalSplit: basic case") {
-    val featureIndex = 0
-    val featureArity = 4
-    val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
-    val labels = Array(0.0, 0.0, 1.0, 1.0, 2.0)
-    val impurity = Entropy
-    val metadata = new AltDTMetadata(numClasses = 3, maxBins = 16, minInfoGain = 0.0, impurity,
-      Map(featureIndex -> featureArity))
-    val allSplits = metadata.getUnorderedSplits(featureIndex)
-    val (split, _) = AltDT.chooseUnorderedCategoricalSplit(featureIndex, values, values.indices.toArray,
-      labels, 0, values.length, metadata, featureArity, allSplits)
-    split match {
-      case Some(s: CategoricalSplit) =>
-        assert(s.featureIndex === featureIndex)
-        assert(s.leftCategories.toSet === Set(0.0, 2.0))
-        assert(s.rightCategories.toSet === Set(1.0, 3.0))
-        // TODO: test correctness of stats
-      case _ =>
-        throw new AssertionError(
-          s"Expected CategoricalSplit but got ${split.getClass.getSimpleName}")
-    }
-  }
-
-  test("chooseUnorderedCategoricalSplit: return bad split if we should not split") {
-    val featureIndex = 0
-    val featureArity = 4
-    val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
-    val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0)
-    val impurity = Entropy
-    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
-      Map(featureIndex -> featureArity))
-    val (split, stats) =
-      AltDT.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray, labels, 0, values.length,
-        metadata, featureArity)
-    assert(split.isEmpty)
-    val fullImpurityStatsArray =
-      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
-    assert(stats.gain === 0.0)
-    assert(stats.impurity === fullImpurity)
-    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
-    assert(stats.valid)
-  }
-
-  test("chooseContinuousSplit: basic case") {
-    val featureIndex = 0
-    val values = Array(0.1, 0.2, 0.3, 0.4, 0.5)
-    val labels = Array(0.0, 0.0, 1.0, 1.0, 1.0)
-    val impurity = Entropy
-    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map.empty[Int, Int])
-    val (split, stats) = AltDT.chooseContinuousSplit(featureIndex, values, values.indices.toArray, labels,
-      0, values.length, metadata)
-    split match {
-      case Some(s: ContinuousSplit) =>
-        assert(s.featureIndex === featureIndex)
-        assert(s.threshold === 0.2)
-      case _ =>
-        throw new AssertionError(
-          s"Expected ContinuousSplit but got ${split.getClass.getSimpleName}")
-    }
-    val fullImpurityStatsArray =
-      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
-    assert(stats.gain === fullImpurity)
-    assert(stats.impurity === fullImpurity)
-    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
-    assert(stats.leftImpurityCalculator.stats === Array(2.0, 0.0))
-    assert(stats.rightImpurityCalculator.stats === Array(0.0, 3.0))
-    assert(stats.valid)
-  }
-
-  test("chooseContinuousSplit: return bad split if we should not split") {
-    val featureIndex = 0
-    val values = Array(0.1, 0.2, 0.3, 0.4, 0.5)
-    val labels = Array(0.0, 0.0, 0.0, 0.0, 0.0)
-    val impurity = Entropy
-    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map.empty[Int, Int])
-    val (split, stats) = AltDT.chooseContinuousSplit(featureIndex, values, values.indices.toArray, labels,
-      0, values.length, metadata)
-    // split should be None
-    assert(split.isEmpty)
-    // stats for parent node should be correct
-    val fullImpurityStatsArray =
-      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
-    assert(stats.gain === 0.0)
-    assert(stats.impurity === fullImpurity)
-    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
-  }
-
-  /* * * * * * * * * * * Bit subvectors * * * * * * * * * * */
-
-  test("bitSubvectorFromSplit: 1 node") {
-    val col =
-      FeatureVector.fromOriginal(0, 0, Vectors.dense(0.1, 0.2, 0.4, 0.6, 0.7))
-    val fromOffset = 0
-    val toOffset = col.values.length
-    val numRows = toOffset
-    val split = new ContinuousSplit(0, threshold = 0.5)
-    val bitv = AltDT.bitVectorFromSplit(col, fromOffset, toOffset, split, numRows)
-    assert(bitv.toArray.toSet === Set(3, 4))
-  }
-
-  test("bitSubvectorFromSplit: 2 nodes") {
-    // Initially, 1 split: (0, 2, 4) | (1, 3)
-    val col = new FeatureVector(0, 0, Array(0.1, 0.2, 0.4, 0.6, 0.7),
-      Array(4, 2, 0, 1, 3))
-    def checkSplit(fromOffset: Int, toOffset: Int, threshold: Double,
-      expectedRight: Set[Int]): Unit = {
-        val split = new ContinuousSplit(0, threshold)
-        val numRows = col.values.length
-        val bitv = AltDT.bitVectorFromSplit(col, fromOffset, toOffset, split, numRows)
-        assert(bitv.toArray.toSet === expectedRight)
-    }
-    // Left child node
-    checkSplit(0, 3, 0.05, Set(0, 2, 4))
-    checkSplit(0, 3, 0.15, Set(0, 2))
-    checkSplit(0, 3, 0.2, Set(0))
-    checkSplit(0, 3, 0.5, Set())
-    // Right child node
-    checkSplit(3, 5, 0.1, Set(1, 3))
-    checkSplit(3, 5, 0.65, Set(3))
-    checkSplit(3, 5, 0.8, Set())
-  }
-
-  test("collectBitVectors with 1 vector") {
-    val col =
-      FeatureVector.fromOriginal(0, 0, Vectors.dense(0.1, 0.2, 0.4, 0.6, 0.7))
-    val numRows = col.values.length
-    val activeNodes = new BitSet(1)
-    activeNodes.set(0)
-    val info = PartitionInfo(Array(col), Array(0, numRows), activeNodes)
-    val partitionInfos = sc.parallelize(Seq(info))
-    val bestSplit = new ContinuousSplit(0, threshold = 0.5)
-    val bitVector = AltDT.aggregateBitVector(partitionInfos, Array(Some(bestSplit)), numRows)
-    assert(bitVector.toArray.toSet === Set(3, 4))
-  }
-
-  test("collectBitVectors with 1 vector, with tied threshold") {
-    val col = new FeatureVector(0, 0,
-      Array(-4.0, -4.0, -2.0, -2.0, -1.0, -1.0, 1.0, 1.0),
-      Array(3, 7, 2, 6, 1, 5, 0, 4))
-    val numRows = col.values.length
-    val activeNodes = new BitSet(1)
-    activeNodes.set(0)
-    val info = PartitionInfo(Array(col), Array(0, numRows), activeNodes)
-    val partitionInfos = sc.parallelize(Seq(info))
-    val bestSplit = new ContinuousSplit(0, threshold = -2.0)
-    val bitVector = AltDT.aggregateBitVector(partitionInfos, Array(Some(bestSplit)), numRows)
-    assert(bitVector.toArray.toSet === Set(0, 1, 4, 5))
-  }
-
-  /* * * * * * * * * * * Active nodes * * * * * * * * * * */
-
-  test("computeActiveNodePeriphery") {
-    // old periphery: 2 nodes
-    val left = LearningNode.emptyNode(id = 1)
-    val right = LearningNode.emptyNode(id = 2)
-    val oldPeriphery: Array[LearningNode] = Array(left, right)
-    // bestSplitsAndGains: Do not split left, but split right node.
-    val lCalc = new EntropyCalculator(Array(8.0, 1.0))
-    val lStats = new ImpurityStats(0.0, lCalc.calculate(),
-      lCalc, lCalc, new EntropyCalculator(Array(0.0, 0.0)))
-
-    val rSplit = new ContinuousSplit(featureIndex = 1, threshold = 0.6)
-    val rCalc = new EntropyCalculator(Array(5.0, 7.0))
-    val rRightChildCalc = new EntropyCalculator(Array(1.0, 5.0))
-    val rLeftChildCalc = new EntropyCalculator(Array(
-      rCalc.stats(0) - rRightChildCalc.stats(0),
-      rCalc.stats(1) - rRightChildCalc.stats(1)))
-    val rGain = {
-      val rightWeight = rRightChildCalc.stats.sum / rCalc.stats.sum
-      val leftWeight = rLeftChildCalc.stats.sum / rCalc.stats.sum
-      rCalc.calculate() -
-        rightWeight * rRightChildCalc.calculate() - leftWeight * rLeftChildCalc.calculate()
-    }
-    val rStats =
-      new ImpurityStats(rGain, rCalc.calculate(), rCalc, rLeftChildCalc, rRightChildCalc)
-
-    val bestSplitsAndGains: Array[(Option[Split], ImpurityStats)] =
-      Array((None, lStats), (Some(rSplit), rStats))
-
-    // Test A: Split right node
-    val newPeriphery1: Array[LearningNode] =
-      AltDT.computeActiveNodePeriphery(oldPeriphery, bestSplitsAndGains, minInfoGain = 0.0)
-    // Expect 2 active nodes
-    assert(newPeriphery1.length === 2)
-    // Confirm right node was updated
-    assert(right.split.get === rSplit)
-    assert(!right.isLeaf)
-    assert(right.stats.exactlyEquals(rStats))
-    assert(right.leftChild.nonEmpty && right.leftChild.get === newPeriphery1(0))
-    assert(right.rightChild.nonEmpty && right.rightChild.get === newPeriphery1(1))
-    // Confirm new active nodes have stats but no children
-    assert(newPeriphery1(0).leftChild.isEmpty && newPeriphery1(0).rightChild.isEmpty &&
-      newPeriphery1(0).split.isEmpty &&
-      newPeriphery1(0).stats.impurityCalculator.exactlyEquals(rLeftChildCalc))
-    assert(newPeriphery1(1).leftChild.isEmpty && newPeriphery1(1).rightChild.isEmpty &&
-      newPeriphery1(1).split.isEmpty &&
-      newPeriphery1(1).stats.impurityCalculator.exactlyEquals(rRightChildCalc))
-
-    // Test B: Increase minInfoGain, so split nothing
-    val newPeriphery2: Array[LearningNode] =
-      AltDT.computeActiveNodePeriphery(oldPeriphery, bestSplitsAndGains, minInfoGain = 1000.0)
-    assert(newPeriphery2.isEmpty)
-  }
+//  test("numUnorderedBins") {
+//    // Note: We have duplicate bins (the inverse) for unordered features.  This should be fixed!
+//    assert(AltDT.numUnorderedBins(2) === 2)  // 2 categories => 2 bins
+//    assert(AltDT.numUnorderedBins(3) === 6)  // 3 categories => 6 bins
+//  }
+//
+//  /* * * * * * * * * * * Choosing Splits  * * * * * * * * * * */
+//
+//  test("computeBestSplits") {
+//    // TODO
+//  }
+//
+//  test("chooseSplit: choose correct type of split") {
+//    val labels = Seq(0, 0, 0, 1, 1, 1, 1).map(_.toDouble).toArray
+//    val fromOffset = 1
+//    val toOffset = 4
+//    val impurity = Entropy
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map(1 -> 3))
+//
+//    val col1 = FeatureVector.fromOriginal(featureIndex = 0, featureArity = 0,
+//      vector = Vectors.dense(0.8, 0.1, 0.1, 0.2, 0.3, 0.5, 0.6), metadata)
+//    val (split1, _) = col1.chooseSplit(fromOffset, toOffset, labels)
+//    assert(split1.nonEmpty && split1.get.isInstanceOf[ContinuousSplit])
+//
+//    val col2 = FeatureVector.fromOriginal(featureIndex = 1, featureArity = 3,
+//      vector = Vectors.dense(0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0), metadata)
+//    val (split2, _) = col2.chooseSplit(fromOffset, toOffset, labels)
+//    assert(split2.nonEmpty && split2.get.isInstanceOf[CategoricalSplit])
+//  }
+//
+//  test("chooseOrderedCategoricalSplit: basic case") {
+//    val featureIndex = 0
+//    val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
+//    val featureArity = values.max.toInt + 1
+//
+//    def testHelper(
+//        labels: Array[Double],
+//        expectedLeftCategories: Array[Double],
+//        expectedLeftStats: Array[Double],
+//        expectedRightStats: Array[Double]): Unit = {
+//      val expectedRightCategories = Range(0, featureArity)
+//        .filter(c => !expectedLeftCategories.contains(c)).map(_.toDouble).toArray
+//      val impurity = Entropy
+//      val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0,
+//        impurity, Map.empty[Int, Int])
+//      val col = createUnsortedVector(featureIndex, featureArity, values,
+//        values.indices.toArray, metadata)
+//      val (split, stats) = col.chooseSplit(0, values.length, labels)
+//      split match {
+//        case Some(s: CategoricalSplit) =>
+//          assert(s.featureIndex === featureIndex)
+//          assert(s.leftCategories === expectedLeftCategories)
+//          assert(s.rightCategories === expectedRightCategories)
+//        case _ =>
+//          throw new AssertionError(
+//            s"Expected CategoricalSplit but got ${split.getClass.getSimpleName}")
+//      }
+//      val fullImpurityStatsArray =
+//        Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
+//      val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
+//      assert(stats.gain === fullImpurity)
+//      assert(stats.impurity === fullImpurity)
+//      assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+//      assert(stats.leftImpurityCalculator.stats === expectedLeftStats)
+//      assert(stats.rightImpurityCalculator.stats === expectedRightStats)
+//      assert(stats.valid)
+//    }
+//
+//    val labels1 = Array(0, 0, 1, 1, 1, 1, 1).map(_.toDouble)
+//    testHelper(labels1, Array(0.0), Array(2.0, 0.0), Array(0.0, 5.0))
+//
+//    val labels2 = Array(0, 0, 0, 1, 1, 1, 1).map(_.toDouble)
+//    testHelper(labels2, Array(0.0, 1.0), Array(3.0, 0.0), Array(0.0, 4.0))
+//  }
+//
+//  test("chooseOrderedCategoricalSplit: return bad split if we should not split") {
+//    val featureIndex = 0
+//    val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
+//    val featureArity = values.max.toInt + 1
+//
+//    val labels = Array(1, 1, 1, 1, 1, 1, 1).map(_.toDouble)
+//
+//    val impurity = Entropy
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
+//      Map(featureIndex -> featureArity))
+//    val col = createUnsortedVector(featureIndex, featureArity, values,
+//      values.indices.toArray, metadata)
+//    val (split, stats) = col.chooseSplit(0, values.length, labels)
+//    assert(split.isEmpty)
+//    val fullImpurityStatsArray =
+//      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
+//    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
+//    assert(stats.gain === 0.0)
+//    assert(stats.impurity === fullImpurity)
+//    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+//    assert(stats.valid)
+//  }
+//
+//  test("chooseUnorderedCategoricalSplit: basic case") {
+//    val featureIndex = 0
+//    val featureArity = 4
+//    val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
+//    val labels = Array(0.0, 0.0, 1.0, 1.0, 2.0)
+//    val impurity = Entropy
+//    val metadata = new AltDTMetadata(numClasses = 3, maxBins = 16, minInfoGain = 0.0, impurity,
+//      Map(featureIndex -> featureArity))
+//    val col = createUnsortedVector(featureIndex, featureArity, values,
+//      values.indices.toArray, metadata)
+//    val (split, _) = col.chooseSplit(0, values.length, labels)
+//    split match {
+//      case Some(s: CategoricalSplit) =>
+//        assert(s.featureIndex === featureIndex)
+//        assert(s.leftCategories.toSet === Set(0.0, 2.0))
+//        assert(s.rightCategories.toSet === Set(1.0, 3.0))
+//        // TODO: test correctness of stats
+//      case _ =>
+//        throw new AssertionError(
+//          s"Expected CategoricalSplit but got ${split.getClass.getSimpleName}")
+//    }
+//  }
+//
+//  test("chooseUnorderedCategoricalSplit: return bad split if we should not split") {
+//    val featureIndex = 0
+//    val featureArity = 4
+//    val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
+//    val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0)
+//    val impurity = Entropy
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
+//      Map(featureIndex -> featureArity))
+//    val col = createUnsortedVector(featureIndex, featureArity, values, values.indices.toArray, metadata)
+//    val (split, stats) = col.chooseSplit(0, values.length, labels)
+//    assert(split.isEmpty)
+//    val fullImpurityStatsArray =
+//      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
+//    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
+//    assert(stats.gain === 0.0)
+//    assert(stats.impurity === fullImpurity)
+//    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+//    assert(stats.valid)
+//  }
+//
+//  test("chooseContinuousSplit: basic case") {
+//    val featureIndex = 0
+//    val featureArity = 0
+//    val values = Array(0.1, 0.2, 0.3, 0.4, 0.5)
+//    val labels = Array(0.0, 0.0, 1.0, 1.0, 1.0)
+//    val impurity = Entropy
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map.empty[Int, Int])
+//    val col = createUnsortedVector(featureIndex, featureArity, values, values.indices.toArray, metadata)
+//    val (split, stats) = col.chooseSplit(0, values.length, labels)
+//    split match {
+//      case Some(s: ContinuousSplit) =>
+//        assert(s.featureIndex === featureIndex)
+//        assert(s.threshold === 0.2)
+//      case _ =>
+//        throw new AssertionError(
+//          s"Expected ContinuousSplit but got ${split.getClass.getSimpleName}")
+//    }
+//    val fullImpurityStatsArray =
+//      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
+//    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
+//    assert(stats.gain === fullImpurity)
+//    assert(stats.impurity === fullImpurity)
+//    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+//    assert(stats.leftImpurityCalculator.stats === Array(2.0, 0.0))
+//    assert(stats.rightImpurityCalculator.stats === Array(0.0, 3.0))
+//    assert(stats.valid)
+//  }
+//
+//  test("chooseContinuousSplit: return bad split if we should not split") {
+//    val featureIndex = 0
+//    val featureArity = 0
+//    val values = Array(0.1, 0.2, 0.3, 0.4, 0.5)
+//    val labels = Array(0.0, 0.0, 0.0, 0.0, 0.0)
+//    val impurity = Entropy
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map.empty[Int, Int])
+//    val col = createUnsortedVector(featureIndex, featureArity, values, values.indices.toArray, metadata)
+//    val (split, stats) = col.chooseSplit(0, values.length, labels)
+//    // split should be None
+//    assert(split.isEmpty)
+//    // stats for parent node should be correct
+//    val fullImpurityStatsArray =
+//      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
+//    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
+//    assert(stats.gain === 0.0)
+//    assert(stats.impurity === fullImpurity)
+//    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+//  }
+//
+//  /* * * * * * * * * * * Bit subvectors * * * * * * * * * * */
+//
+//  test("bitSubvectorFromSplit: 1 node") {
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map.empty[Int, Int])
+//    val col =
+//      FeatureVector.fromOriginal(0, 0, Vectors.dense(0.1, 0.2, 0.4, 0.6, 0.7), metadata)
+//    val fromOffset = 0
+//    val toOffset = col.values.length
+//    val numRows = toOffset
+//    val split = new ContinuousSplit(0, threshold = 0.5)
+//    val bitv = AltDT.bitVectorFromSplit(col, fromOffset, toOffset, split, numRows)
+//    assert(bitv.toArray.toSet === Set(3, 4))
+//  }
+//
+//  test("bitSubvectorFromSplit: 2 nodes") {
+//    // Initially, 1 split: (0, 2, 4) | (1, 3)
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map.empty[Int, Int])
+//    val col = createUnsortedVector(0, 0, Array(0.1, 0.2, 0.4, 0.6, 0.7), Array(4, 2, 0, 1, 3), metadata)
+//    def checkSplit(fromOffset: Int, toOffset: Int, threshold: Double,
+//      expectedRight: Set[Int]): Unit = {
+//        val split = new ContinuousSplit(0, threshold)
+//        val numRows = col.values.length
+//        val bitv = AltDT.bitVectorFromSplit(col, fromOffset, toOffset, split, numRows)
+//        assert(bitv.toArray.toSet === expectedRight)
+//    }
+//    // Left child node
+//    checkSplit(0, 3, 0.05, Set(0, 2, 4))
+//    checkSplit(0, 3, 0.15, Set(0, 2))
+//    checkSplit(0, 3, 0.2, Set(0))
+//    checkSplit(0, 3, 0.5, Set())
+//    // Right child node
+//    checkSplit(3, 5, 0.1, Set(1, 3))
+//    checkSplit(3, 5, 0.65, Set(3))
+//    checkSplit(3, 5, 0.8, Set())
+//  }
+//
+//  test("collectBitVectors with 1 vector") {
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map.empty[Int, Int])
+//    val col =
+//      FeatureVector.fromOriginal(0, 0, Vectors.dense(0.1, 0.2, 0.4, 0.6, 0.7), metadata)
+//    val numRows = col.values.length
+//    val activeNodes = new BitSet(1)
+//    activeNodes.set(0)
+//    val info = PartitionInfo(Array(col), Array(0, numRows), activeNodes)
+//    val partitionInfos = sc.parallelize(Seq(info))
+//    val bestSplit = new ContinuousSplit(0, threshold = 0.5)
+//    val bitVector = AltDT.aggregateBitVector(partitionInfos, Array(Some(bestSplit)), numRows)
+//    assert(bitVector.toArray.toSet === Set(3, 4))
+//  }
+//
+//  test("collectBitVectors with 1 vector, with tied threshold") {
+//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map.empty[Int, Int])
+//    val col = createUnsortedVector(0, 0,
+//      Array(-4.0, -4.0, -2.0, -2.0, -1.0, -1.0, 1.0, 1.0),
+//      Array(3, 7, 2, 6, 1, 5, 0, 4), metadata)
+//    val numRows = col.values.length
+//    val activeNodes = new BitSet(1)
+//    activeNodes.set(0)
+//    val info = PartitionInfo(Array(col), Array(0, numRows), activeNodes)
+//    val partitionInfos = sc.parallelize(Seq(info))
+//    val bestSplit = new ContinuousSplit(0, threshold = -2.0)
+//    val bitVector = AltDT.aggregateBitVector(partitionInfos, Array(Some(bestSplit)), numRows)
+//    assert(bitVector.toArray.toSet === Set(0, 1, 4, 5))
+//  }
+//
+//  /* * * * * * * * * * * Active nodes * * * * * * * * * * */
+//
+//  test("computeActiveNodePeriphery") {
+//    // old periphery: 2 nodes
+//    val left = LearningNode.emptyNode(id = 1)
+//    val right = LearningNode.emptyNode(id = 2)
+//    val oldPeriphery: Array[LearningNode] = Array(left, right)
+//    // bestSplitsAndGains: Do not split left, but split right node.
+//    val lCalc = new EntropyCalculator(Array(8.0, 1.0))
+//    val lStats = new ImpurityStats(0.0, lCalc.calculate(),
+//      lCalc, lCalc, new EntropyCalculator(Array(0.0, 0.0)))
+//
+//    val rSplit = new ContinuousSplit(featureIndex = 1, threshold = 0.6)
+//    val rCalc = new EntropyCalculator(Array(5.0, 7.0))
+//    val rRightChildCalc = new EntropyCalculator(Array(1.0, 5.0))
+//    val rLeftChildCalc = new EntropyCalculator(Array(
+//      rCalc.stats(0) - rRightChildCalc.stats(0),
+//      rCalc.stats(1) - rRightChildCalc.stats(1)))
+//    val rGain = {
+//      val rightWeight = rRightChildCalc.stats.sum / rCalc.stats.sum
+//      val leftWeight = rLeftChildCalc.stats.sum / rCalc.stats.sum
+//      rCalc.calculate() -
+//        rightWeight * rRightChildCalc.calculate() - leftWeight * rLeftChildCalc.calculate()
+//    }
+//    val rStats =
+//      new ImpurityStats(rGain, rCalc.calculate(), rCalc, rLeftChildCalc, rRightChildCalc)
+//
+//    val bestSplitsAndGains: Array[(Option[Split], ImpurityStats)] =
+//      Array((None, lStats), (Some(rSplit), rStats))
+//
+//    // Test A: Split right node
+//    val newPeriphery1: Array[LearningNode] =
+//      AltDT.computeActiveNodePeriphery(oldPeriphery, bestSplitsAndGains, minInfoGain = 0.0)
+//    // Expect 2 active nodes
+//    assert(newPeriphery1.length === 2)
+//    // Confirm right node was updated
+//    assert(right.split.get === rSplit)
+//    assert(!right.isLeaf)
+//    assert(right.stats.exactlyEquals(rStats))
+//    assert(right.leftChild.nonEmpty && right.leftChild.get === newPeriphery1(0))
+//    assert(right.rightChild.nonEmpty && right.rightChild.get === newPeriphery1(1))
+//    // Confirm new active nodes have stats but no children
+//    assert(newPeriphery1(0).leftChild.isEmpty && newPeriphery1(0).rightChild.isEmpty &&
+//      newPeriphery1(0).split.isEmpty &&
+//      newPeriphery1(0).stats.impurityCalculator.exactlyEquals(rLeftChildCalc))
+//    assert(newPeriphery1(1).leftChild.isEmpty && newPeriphery1(1).rightChild.isEmpty &&
+//      newPeriphery1(1).split.isEmpty &&
+//      newPeriphery1(1).stats.impurityCalculator.exactlyEquals(rRightChildCalc))
+//
+//    // Test B: Increase minInfoGain, so split nothing
+//    val newPeriphery2: Array[LearningNode] =
+//      AltDT.computeActiveNodePeriphery(oldPeriphery, bestSplitsAndGains, minInfoGain = 1000.0)
+//    assert(newPeriphery2.isEmpty)
+//  }
 }
