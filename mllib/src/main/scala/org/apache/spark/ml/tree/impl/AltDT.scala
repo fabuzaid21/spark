@@ -439,10 +439,10 @@ private[ml] object AltDT extends Logging {
     } else {
       if (fromOffset == 0 && toOffset == labels.length) {
         chooseContinuousSplitAllLabels(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset, metadata)
-      } else if (toOffset - fromOffset <= L3_CACHE_SIZE) {
-        chooseContinuousSplitCache(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset, metadata)
+      //} else if (toOffset - fromOffset <= L3_CACHE_SIZE) {
+      //  chooseContinuousSplitNaive(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset, metadata)
       } else {
-        chooseContinuousSplitNaive(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset, metadata)
+        chooseContinuousSplitCache(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset, metadata)
       }
     }
   }
