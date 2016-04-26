@@ -170,9 +170,9 @@ private[ml] object AltDT extends Logging {
     val colStoreInit: RDD[(Int, Vector)] = colStoreInput.getOrElse(
       rowToColumnStoreDense(input.map(_.features)))
     val numRows: Int = colStoreInit.first()._2.size
-    val labels = new Array[Double](numRows)
+    val labels = new Array[Byte](numRows)
     input.map(_.label).zipWithIndex().collect().foreach { case (label: Double, rowIndex: Long) =>
-      labels(rowIndex.toInt) = label
+      labels(rowIndex.toInt) = label.toByte
     }
     val labelsBc = input.sparkContext.broadcast(labels)
     // NOTE: Labels are not sorted with features since that would require 1 copy per feature,
@@ -285,7 +285,7 @@ private[ml] object AltDT extends Logging {
    */
   private[impl] def computeBestSplits(
       partitionInfos: RDD[PartitionInfo],
-      labelsBc: Broadcast[Array[Double]],
+      labelsBc: Broadcast[Array[Byte]],
       metadata: AltDTMetadata) = {
     // On each partition, for each feature on the partition, select the best split for each node.
     // This will use:
@@ -429,7 +429,7 @@ private[ml] object AltDT extends Logging {
    */
   private[impl] def chooseSplit(
                                  col: FeatureVector,
-                                 labels: Array[Double],
+                                 labels: Array[Byte],
                                  fromOffset: Int,
                                  toOffset: Int,
                                  fullImpurityAgg: ImpurityAggregatorSingle,
@@ -470,7 +470,7 @@ private[ml] object AltDT extends Logging {
       featureIndex: Int,
       values: Array[Double],
       indices: Array[Int],
-      labels: Array[Double],
+      labels: Array[Byte],
       from: Int,
       to: Int,
       metadata: AltDTMetadata,
@@ -608,7 +608,7 @@ private[ml] object AltDT extends Logging {
       featureIndex: Int,
       values: Array[Double],
       indices: Array[Int],
-      labels: Array[Double],
+      labels: Array[Byte],
       from: Int,
       to: Int,
       metadata: AltDTMetadata,
@@ -694,7 +694,7 @@ private[ml] object AltDT extends Logging {
       featureIndex: Int,
       values: Array[Double],
       indices: Array[Int],
-      labels: Array[Double],
+      labels: Array[Byte],
       from: Int,
       to: Int,
       fullImpurityAgg: ImpurityAggregatorSingle,
@@ -842,7 +842,7 @@ private[ml] object AltDT extends Logging {
      * @return Updated partition info
      */
     def update(instanceBitVector: RoaringBitmap, newNumNodeOffsets: Int,
-               labels: Array[Double], metadata: AltDTMetadata): PartitionInfo = {
+               labels: Array[Byte], metadata: AltDTMetadata): PartitionInfo = {
       // Create a 2-level representation of the new nodeOffsets (to be flattened).
       // These 2 levels correspond to original nodes and their children (if split).
       val newNodeOffsets = nodeOffsets.map(Array(_))
@@ -890,7 +890,7 @@ private[ml] object AltDT extends Logging {
                col: FeatureVector,
                instanceBitVector: RoaringBitmap,
                metadata: AltDTMetadata,
-               labels: Array[Double],
+               labels: Array[Byte],
                newNodeOffsets: Array[Array[Int]],
                newFullImpurityAggs: Array[Array[ImpurityAggregatorSingle]]) = {
       activeNodes.iterator.foreach { nodeIdx =>
