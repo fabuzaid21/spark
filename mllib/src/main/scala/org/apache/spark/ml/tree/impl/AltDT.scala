@@ -21,7 +21,6 @@ import org.apache.spark.Logging
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.tree._
 import org.apache.spark.ml.tree.impl.TreeUtil._
-import org.apache.spark.mllib.linalg.Vector
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.configuration.Strategy
 import org.apache.spark.mllib.tree.impl.DecisionTreeMetadata
@@ -132,7 +131,7 @@ private[ml] object AltDT extends Logging {
   def train(
       input: RDD[LabeledPoint],
       strategy: Strategy,
-      colStoreInput: Option[RDD[(Int, Vector)]] = None,
+      colStoreInput: Option[RDD[(Int, Array[Double])]] = None,
       parentUID: Option[String] = None): DecisionTreeModel = {
     // TODO: Check validity of params
     // TODO: Check for empty dataset
@@ -145,7 +144,7 @@ private[ml] object AltDT extends Logging {
   private[impl] def trainImpl(
       input: RDD[LabeledPoint],
       strategy: Strategy,
-      colStoreInput: Option[RDD[(Int, Vector)]]): Node = {
+      colStoreInput: Option[RDD[(Int, Array[Double])]]): Node = {
     val metadata = AltDTMetadata.fromStrategy(strategy)
 
     // The case with 1 node (depth = 0) is handled separately.
@@ -166,9 +165,9 @@ private[ml] object AltDT extends Logging {
     //   Note: rowToColumnStoreDense checks to make sure numRows < Int.MaxValue.
     // TODO: Is this mapping from arrays to iterators to arrays (when constructing learningData)?
     //       Or is the mapping implicit (i.e., not costly)?
-    val colStoreInit: RDD[(Int, Vector)] = colStoreInput.getOrElse(
+    val colStoreInit: RDD[(Int, Array[Double])] = colStoreInput.getOrElse(
       rowToColumnStoreDense(input.map(_.features)))
-    val numRows: Int = colStoreInit.first()._2.size
+    val numRows: Int = colStoreInit.first()._2.length
     if (metadata.numClasses > 1 && metadata.numClasses <= 32) {
       AltDTClassification.trainImpl(input, colStoreInit, metadata, numRows, strategy.maxDepth)
     } else {
@@ -740,12 +739,11 @@ private[ml] object AltDT extends Logging {
     def fromOriginal(
                       featureIndex: Int,
                       featureArity: Int,
-                      featureVector: Vector): FeatureVector = {
-      val values = featureVector.toArray
+                      values: Array[Double]): FeatureVector = {
       val indices = values.indices.toArray
       val fv = new FeatureVector(featureIndex, featureArity, values, indices)
       val sorter = new Sorter(new FeatureVectorSortByValue(featureIndex, featureArity))
-      sorter.sort(fv, 0, values.length, Ordering[KeyWrapper[Double]])
+      sorter.sort(fv, 0, values.length, Ordering[KeyWrapper])
       fv
     }
   }
@@ -756,14 +754,14 @@ private[ml] object AltDT extends Logging {
     *                     FeatureVector is allocated during sorting, that new object
     *                     also has the same featureIndex and featureArity
     */
-  private class FeatureVectorSortByValue(featureIndex: Int, featureArity: Int)(implicit ord: Ordering[Double])
-    extends SortDataFormat[KeyWrapper[Double], FeatureVector] {
+  private class FeatureVectorSortByValue(featureIndex: Int, featureArity: Int)
+    extends SortDataFormat[KeyWrapper, FeatureVector] {
 
-    override def newKey(): KeyWrapper[Double] = new KeyWrapper()
+    override def newKey(): KeyWrapper = new KeyWrapper()
 
     override def getKey(data: FeatureVector,
                         pos: Int,
-                        reuse: KeyWrapper[Double]): KeyWrapper[Double] = {
+                        reuse: KeyWrapper): KeyWrapper = {
       if (reuse == null) {
         new KeyWrapper().setKey(data.values(pos))
       } else {
@@ -772,13 +770,21 @@ private[ml] object AltDT extends Logging {
     }
 
     override def getKey(data: FeatureVector,
-                        pos: Int): KeyWrapper[Double] = {
+                        pos: Int): KeyWrapper = {
       getKey(data, pos, null)
     }
 
-    private def swapElements[T](data: Array[T],
+    private def swapElements(data: Array[Double],
                                 pos0: Int,
                                 pos1: Int): Unit = {
+      val tmp = data(pos0)
+      data(pos0) = data(pos1)
+      data(pos1) = tmp
+    }
+
+    private def swapElements(data: Array[Int],
+                             pos0: Int,
+                             pos1: Int): Unit = {
       val tmp = data(pos0)
       data(pos0) = data(pos1)
       data(pos1) = tmp
@@ -814,13 +820,12 @@ private[ml] object AltDT extends Logging {
   /**
     * A wrapper that holds a primitive key – borrowed from [[org.apache.spark.ml.recommendation.ALS.KeyWrapper]]
     */
-  private class KeyWrapper[Double](implicit ord: Ordering[Double])
-    extends Ordered[KeyWrapper[Double]] {
+  private class KeyWrapper extends Ordered[KeyWrapper] {
 
     var key: Double = _
 
-    override def compare(that: KeyWrapper[Double]): Int = {
-      ord.compare(key, that.key)
+    override def compare(that: KeyWrapper): Int = {
+      scala.math.Ordering.Double.compare(key, that.key)
     }
 
     def setKey(key: Double): this.type = {

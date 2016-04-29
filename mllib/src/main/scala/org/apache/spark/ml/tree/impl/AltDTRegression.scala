@@ -2,8 +2,7 @@ package org.apache.spark.ml.tree.impl
 
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.tree._
-import org.apache.spark.ml.tree.impl.AltDT.{PartitionInfo, AltDTMetadata, FeatureVector}
-import org.apache.spark.mllib.linalg
+import org.apache.spark.ml.tree.impl.AltDT.{AltDTMetadata, FeatureVector, PartitionInfo}
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
@@ -15,7 +14,7 @@ object AltDTRegression {
 
   def trainImpl(
                  input: RDD[LabeledPoint],
-                 colStoreInit: RDD[(Int, linalg.Vector)],
+                 colStoreInit: RDD[(Int, Array[Double])],
                  metadata: AltDTMetadata,
                  numRows: Int,
                  maxDepth: Int): Node = {
