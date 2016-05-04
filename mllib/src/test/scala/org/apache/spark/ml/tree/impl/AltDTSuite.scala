@@ -19,11 +19,11 @@ package org.apache.spark.ml.tree.impl
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.ml.regression.DecisionTreeRegressor
-import org.apache.spark.ml.tree._
-import org.apache.spark.ml.tree.impl.AltDT.{PartitionInfo, AltDTMetadata, FeatureVector}
+import org.apache.spark.ml.tree.impl.AltDT.{AltDTMetadata, FeatureVector, PartitionInfo}
+import org.apache.spark.ml.tree.{CategoricalSplit, ContinuousSplit, _}
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.tree.impurity._
+import org.apache.spark.mllib.tree.impurity.{Gini, _}
 import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.util.collection.BitSet
@@ -219,7 +219,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val labelsAsBytes = labels.map(_.toByte)
     val fromOffset = 1
     val toOffset = 4
-    val impurity = Entropy
+    val impurity = Gini
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map(1 -> 3))
     val fullImpurityAgg = metadata.createImpurityAggregator()
     labels.foreach(label => fullImpurityAgg.update(label))
@@ -247,7 +247,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
         expectedRightStats: Array[Double]): Unit = {
       val expectedRightCategories = Range(0, featureArity)
         .filter(c => !expectedLeftCategories.contains(c)).map(_.toDouble).toArray
-      val impurity = Entropy
+      val impurity = Gini
       val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0,
         impurity, Map.empty[Int, Int])
       val (split, stats) =
@@ -287,7 +287,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
 
     val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
-    val impurity = Entropy
+    val impurity = Gini
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
       Map(featureIndex -> featureArity))
     val (split, stats) =
@@ -308,7 +308,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val featureArity = 4
     val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
     val labels = Array(0.0, 0.0, 1.0, 1.0, 2.0)
-    val impurity = Entropy
+    val impurity = Gini
     val metadata = new AltDTMetadata(numClasses = 3, maxBins = 16, minInfoGain = 0.0, impurity,
       Map(featureIndex -> featureArity))
     val allSplits = metadata.getUnorderedSplits(featureIndex)
@@ -331,9 +331,10 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val featureArity = 4
     val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
     val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0).map(_.toByte)
-    val impurity = Entropy
+    val impurity = Gini
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
       Map(featureIndex -> featureArity))
+    //    val splits: Array[CategoricalSplit] = metadata.getUnorderedSplits(featureIndex)
     val (split, stats) =
       AltDTClassification.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray,
         labels, 0, values.length, metadata, featureArity)
@@ -351,7 +352,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val featureIndex = 0
     val values = Array(0.1, 0.2, 0.3, 0.4, 0.5)
     val labels = Array(0.0, 0.0, 1.0, 1.0, 1.0)
-    val impurity = Entropy
+    val impurity = Gini
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map.empty[Int, Int])
     val fullImpurityAgg = metadata.createImpurityAggregator()
     labels.foreach(label => fullImpurityAgg.update(label))
@@ -381,7 +382,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val featureIndex = 0
     val values = Array(0.1, 0.2, 0.3, 0.4, 0.5)
     val labels = Array(0.0, 0.0, 0.0, 0.0, 0.0).map(_.toByte)
-    val impurity = Entropy
+    val impurity = Gini
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map.empty[Int, Int])
     val fullImpurityAgg = metadata.createImpurityAggregator()
     labels.foreach(label => fullImpurityAgg.update(label))

@@ -246,7 +246,7 @@ object AltDTRegression {
       Range(0, featureArity).map { case featureValue =>
         val categoryStats = aggStats(featureValue)
         val centroid = if (categoryStats.getCount != 0) {
-          categoryStats.getCalculator.calculate()
+          categoryStats.calculate()
         } else {
           Double.MaxValue
         }
@@ -294,7 +294,7 @@ object AltDTRegression {
     var bestSplitIndex: Int = -1  // index into categoriesSortedByCentroid
     val bestLeftImpurityAgg = leftImpurityAgg.deepCopy()
     var bestGain: Double = 0.0
-    val fullImpurity = rightImpurityAgg.getCalculator.calculate()
+    val fullImpurity = rightImpurityAgg.calculate()
     var leftCount: Double = 0.0
     var rightCount: Double = rightImpurityAgg.getCount
     val fullCount: Double = rightCount
@@ -313,8 +313,8 @@ object AltDTRegression {
       // Compute impurity
       val leftWeight = leftCount / fullCount
       val rightWeight = rightCount / fullCount
-      val leftImpurity = leftImpurityAgg.getCalculator.calculate()
-      val rightImpurity = rightImpurityAgg.getCalculator.calculate()
+      val leftImpurity = leftImpurityAgg.calculate()
+      val rightImpurity = rightImpurityAgg.calculate()
       val gain = fullImpurity - leftWeight * leftImpurity - rightWeight * rightImpurity
       if (leftCount != 0 && rightCount != 0 && gain > bestGain && gain > metadata.minInfoGain) {
         bestSplitIndex = sortedCatIndex
@@ -380,11 +380,11 @@ object AltDTRegression {
     val leftImpurityAgg = metadata.createImpurityAggregator()
     val fullImpurityAgg = metadata.createImpurityAggregator()
     aggStats.foreach(fullImpurityAgg.add)
-    val fullImpurity = fullImpurityAgg.getCalculator.calculate()
+    val fullImpurity = fullImpurityAgg.calculate()
 
     if (featureArity == 1) {
       // All instances go right
-      val impurityStats = new ImpurityStats(0.0, fullImpurityAgg.getCalculator.calculate(),
+      val impurityStats = new ImpurityStats(0.0, fullImpurityAgg.calculate(),
         fullImpurityAgg.getCalculator, leftImpurityAgg.getCalculator,
         fullImpurityAgg.getCalculator)
       (None, impurityStats)
@@ -407,8 +407,8 @@ object AltDTRegression {
         // Compute impurity
         val leftWeight = leftCount / fullCount
         val rightWeight = rightCount / fullCount
-        val leftImpurity = leftImpurityAgg.getCalculator.calculate()
-        val rightImpurity = rightImpurityAgg.getCalculator.calculate()
+        val leftImpurity = leftImpurityAgg.calculate()
+        val rightImpurity = rightImpurityAgg.calculate()
         val gain = fullImpurity - leftWeight * leftImpurity - rightWeight * rightImpurity
         if (leftCount != 0 && rightCount != 0 && gain > bestGain && gain > metadata.minInfoGain) {
           bestSplit = Some(split)
@@ -455,7 +455,7 @@ object AltDTRegression {
     var bestThreshold: Double = Double.NegativeInfinity
     val bestLeftImpurityAgg = metadata.createImpurityAggregator()
     var bestGain: Double = 0.0
-    val fullImpurity = rightImpurityAgg.getCalculator.calculate()
+    val fullImpurity = rightImpurityAgg.calculate()
     var leftCount: Int = 0
     var rightCount: Int = to - from
     val fullCount: Double = rightCount
@@ -468,8 +468,8 @@ object AltDTRegression {
         // Check gain
         val leftWeight = leftCount / fullCount
         val rightWeight = rightCount / fullCount
-        val leftImpurity = leftImpurityAgg.getCalculator.calculate()
-        val rightImpurity = rightImpurityAgg.getCalculator.calculate()
+        val leftImpurity = leftImpurityAgg.calculate()
+        val rightImpurity = rightImpurityAgg.calculate()
         val gain = fullImpurity - leftWeight * leftImpurity - rightWeight * rightImpurity
         if (leftCount != 0 && rightCount != 0 && gain > bestGain && gain > metadata.minInfoGain) {
           bestThreshold = currentThreshold
