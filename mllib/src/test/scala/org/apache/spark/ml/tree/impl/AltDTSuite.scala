@@ -209,14 +209,6 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     assert(newInfo2.activeNodes.iterator.toSet === Set(0, 1, 2, 3))
   }
 
-  /* * * * * * * * * * * Misc  * * * * * * * * * * */
-
-  test("numUnorderedBins") {
-    // Note: We have duplicate bins (the inverse) for unordered features.  This should be fixed!
-    assert(AltDT.numUnorderedBins(2) === 2)  // 2 categories => 2 bins
-    assert(AltDT.numUnorderedBins(3) === 6)  // 3 categories => 6 bins
-  }
-
   /* * * * * * * * * * * Choosing Splits  * * * * * * * * * * */
 
   test("computeBestSplits") {
@@ -224,7 +216,8 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
   }
 
   test("chooseSplit: choose correct type of split") {
-    val labels = Array(0, 0, 0, 1, 1, 1, 1).map(_.toByte)
+    val labels = Array(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0)
+    val labelsAsBytes = labels.map(_.toByte)
     val fromOffset = 1
     val toOffset = 4
     val impurity = Entropy
@@ -234,12 +227,12 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
 
     val col1 = FeatureVector.fromOriginal(featureIndex = 0, featureArity = 0,
       featureVector = Vectors.dense(0.8, 0.1, 0.1, 0.2, 0.3, 0.5, 0.6))
-    val (split1, _) = AltDT.chooseSplit(col1, labels, fromOffset, toOffset, fullImpurityAgg, metadata)
+    val (split1, _) = AltDTClassification.chooseSplit(col1, labelsAsBytes, fromOffset, toOffset, fullImpurityAgg, metadata)
     assert(split1.nonEmpty && split1.get.isInstanceOf[ContinuousSplit])
 
     val col2 = FeatureVector.fromOriginal(featureIndex = 1, featureArity = 3,
       featureVector = Vectors.dense(0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0))
-    val (split2, _) = AltDT.chooseSplit(col2, labels, fromOffset, toOffset, fullImpurityAgg, metadata)
+    val (split2, _) = AltDTRegression.chooseSplit(col2, labels, fromOffset, toOffset, fullImpurityAgg, metadata)
     assert(split2.nonEmpty && split2.get.isInstanceOf[CategoricalSplit])
   }
 
@@ -259,8 +252,8 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
       val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0,
         impurity, Map.empty[Int, Int])
       val (split, stats) =
-        AltDT.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray, labels, 0,
-          values.length, metadata, featureArity)
+        AltDTClassification.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray,
+          labels, 0, values.length, metadata, featureArity)
       split match {
         case Some(s: CategoricalSplit) =>
           assert(s.featureIndex === featureIndex)
@@ -293,14 +286,14 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
     val featureArity = values.max.toInt + 1
 
-    val labels = Array(1, 1, 1, 1, 1, 1, 1).map(_.toByte)
+    val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
     val impurity = Entropy
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
       Map(featureIndex -> featureArity))
     val (split, stats) =
-      AltDT.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray, labels, 0,
-        values.length, metadata, featureArity)
+      AltDTRegression.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray,
+        labels, 0, values.length, metadata, featureArity)
     assert(split.isEmpty)
     val fullImpurityStatsArray =
       Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
@@ -315,12 +308,12 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val featureIndex = 0
     val featureArity = 4
     val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
-    val labels = Array(0.0, 0.0, 1.0, 1.0, 2.0).map(_.toByte)
+    val labels = Array(0.0, 0.0, 1.0, 1.0, 2.0)
     val impurity = Entropy
     val metadata = new AltDTMetadata(numClasses = 3, maxBins = 16, minInfoGain = 0.0, impurity,
       Map(featureIndex -> featureArity))
     val allSplits = metadata.getUnorderedSplits(featureIndex)
-    val (split, _) = AltDT.chooseUnorderedCategoricalSplit(featureIndex, values, values.indices.toArray,
+    val (split, _) = AltDTRegression.chooseUnorderedCategoricalSplit(featureIndex, values, values.indices.toArray,
       labels, 0, values.length, metadata, featureArity, allSplits)
     split match {
       case Some(s: CategoricalSplit) =>
@@ -343,8 +336,8 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
       Map(featureIndex -> featureArity))
     val (split, stats) =
-      AltDT.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray, labels, 0, values.length,
-        metadata, featureArity)
+      AltDTClassification.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray,
+        labels, 0, values.length, metadata, featureArity)
     assert(split.isEmpty)
     val fullImpurityStatsArray =
       Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
@@ -358,14 +351,14 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
   test("chooseContinuousSplit: basic case") {
     val featureIndex = 0
     val values = Array(0.1, 0.2, 0.3, 0.4, 0.5)
-    val labels = Array(0.0, 0.0, 1.0, 1.0, 1.0).map(_.toByte)
+    val labels = Array(0.0, 0.0, 1.0, 1.0, 1.0)
     val impurity = Entropy
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map.empty[Int, Int])
     val fullImpurityAgg = metadata.createImpurityAggregator()
     labels.foreach(label => fullImpurityAgg.update(label))
 
-    val (split, stats) = AltDT.chooseContinuousSplit(featureIndex, values, values.indices.toArray, labels,
-      0, values.length, fullImpurityAgg, metadata)
+    val (split, stats) = AltDTRegression.chooseContinuousSplit(featureIndex, values,
+      values.indices.toArray, labels, 0, values.length, fullImpurityAgg, metadata)
     split match {
       case Some(s: ContinuousSplit) =>
         assert(s.featureIndex === featureIndex)
@@ -394,8 +387,8 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val fullImpurityAgg = metadata.createImpurityAggregator()
     labels.foreach(label => fullImpurityAgg.update(label))
 
-    val (split, stats) = AltDT.chooseContinuousSplit(featureIndex, values, values.indices.toArray, labels,
-      0, values.length, fullImpurityAgg, metadata)
+    val (split, stats) = AltDTClassification.chooseContinuousSplit(featureIndex, values, values.indices.toArray,
+      labels, 0, values.length, fullImpurityAgg, metadata)
     // split should be None
     assert(split.isEmpty)
     // stats for parent node should be correct
