@@ -8,7 +8,6 @@ import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.collection.BitSet
-import org.roaringbitmap.RoaringBitmap
 
 object AltDTRegression {
 
@@ -48,11 +47,12 @@ object AltDTRegression {
       fullImpurityAgg.update(labels(i))
       i += 1
     }
-    var partitionInfos: RDD[PartitionInfo] = groupedColStore.map { groupedCols =>
-      val initActive = new BitSet(1)
-      initActive.set(0)
+    var nodeOffsets = Array[Int](0, numRows)
+    var activeNodes = new BitSet(1)
+    activeNodes.set(0)
 
-      new PartitionInfo(groupedCols, Array[Int](0, numRows), initActive, Array(fullImpurityAgg))
+    var partitionInfos: RDD[PartitionInfo] = groupedColStore.map { groupedCols =>
+      new PartitionInfo(groupedCols, Array(fullImpurityAgg))
     }
 
     // Initialize model.
@@ -68,7 +68,7 @@ object AltDTRegression {
     while (currentLevel < maxDepth && !doneLearning) {
       // Compute best split for each active node.
       val bestSplitsAndGains: Array[(Option[Split], ImpurityStats)] =
-        computeBestSplits(partitionInfos, labelsBc, metadata)
+        computeBestSplits(partitionInfos, activeNodes, nodeOffsets, labelsBc, metadata)
       /*
       // NOTE: The actual active nodes (activeNodePeriphery) may be a subset of the nodes under
       //       bestSplitsAndGains since
@@ -94,22 +94,28 @@ object AltDTRegression {
 
       if (!doneLearning) {
         val splits: Array[Option[Split]] = bestSplitsAndGains.map(_._1)
-
         // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right
-        val aggBitVector: RoaringBitmap = AltDT.aggregateBitVector(partitionInfos, splits, numRows)
+        val (offsets, aggBitVector) = AltDT.aggregateBitVector(partitionInfos, splits,
+          activeNodes, nodeOffsets, numRows)
+        // Identify the new activeNodes based on the 2-level representation of the new nodeOffsets.
+        val newNodeOffsets = AltDT.getNewNodeOffsets(nodeOffsets, offsets)
+
         val newPartitionInfos = partitionInfos.map { partitionInfo =>
           val bv = new BitSet(numRows)
           val iter = aggBitVector.getIntIterator
           while(iter.hasNext) {
             bv.set(iter.next)
           }
-          partitionInfo.update(bv, numNodeOffsets, labelsBc.value, metadata)
+          partitionInfo.update(bv, activeNodes, newNodeOffsets, labelsBc.value, metadata)
         }
+
         // TODO: remove.  For some reason, this is needed to make things work.
         // Probably messing up somewhere above...
         newPartitionInfos.cache().count()
         partitionInfos = newPartitionInfos
 
+        activeNodes = AltDT.getNewActiveNodes(numNodeOffsets, newNodeOffsets)
+        nodeOffsets = newNodeOffsets.flatten
       }
       currentLevel += 1
     }
@@ -130,6 +136,8 @@ object AltDTRegression {
    */
   private[impl] def computeBestSplits(
                                        partitionInfos: RDD[PartitionInfo],
+                                       activeNodes: BitSet,
+                                       nodeOffsets: Array[Int],
                                        labelsBc: Broadcast[Array[Double]],
                                        metadata: AltDTMetadata) = {
     // On each partition, for each feature on the partition, select the best split for each node.
@@ -141,8 +149,7 @@ object AltDTRegression {
     //   for each active node, best split + info gain,
     //     where the best split is None if no useful split exists
     val partBestSplitsAndGains: RDD[Array[(Option[Split], ImpurityStats)]] = partitionInfos.map {
-      case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
-      activeNodes: BitSet, fullImpurityAggs: Array[ImpurityAggregatorSingle]) =>
+      case PartitionInfo(columns: Array[FeatureVector], fullImpurityAggs: Array[ImpurityAggregatorSingle]) =>
         val localLabels = labelsBc.value
         // Iterate over the active nodes in the current level.
         val toReturn = new Array[(Option[Split], ImpurityStats)](activeNodes.cardinality())

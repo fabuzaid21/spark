@@ -175,6 +175,33 @@ private[ml] object AltDT extends Logging {
     }
   }
 
+  def getNewNodeOffsets(nodeOffsets: Array[Int], offsets: Array[(Int, Int)]): Array[Array[Int]] = {
+    val newNodeOffsets = nodeOffsets.map(Array(_))
+    offsets.foreach { case (nodeIdx, numBitsNotSet) =>
+      val oldOffset = newNodeOffsets(nodeIdx)(0)
+      newNodeOffsets(nodeIdx) = Array(oldOffset, oldOffset + numBitsNotSet)
+    }
+    newNodeOffsets
+  }
+
+  def getNewActiveNodes(numNodeOffsets: Int, newNodeOffsets: Array[Array[Int]]): BitSet = {
+    val toReturn = new BitSet(numNodeOffsets - 1)
+    var newNodeOffsetsIdx = 0
+    var i = 0
+    while (i < newNodeOffsets.length) {
+      val offsets = newNodeOffsets(i)
+      if (offsets.length == 2) {
+        toReturn.set(newNodeOffsetsIdx)
+        toReturn.set(newNodeOffsetsIdx + 1)
+        newNodeOffsetsIdx += 2
+      } else {
+        newNodeOffsetsIdx += 1
+      }
+      i += 1
+    }
+    toReturn
+  }
+
 
   /**
    * On driver: Grow tree based on chosen splits, and compute new set of active nodes.
@@ -224,24 +251,26 @@ private[ml] object AltDT extends Logging {
   private[impl] def aggregateBitVector(
       partitionInfos: RDD[PartitionInfo],
       bestSplits: Array[Option[Split]],
-      numRows: Int): RoaringBitmap = {
+      activeNodes: BitSet,
+      nodeOffsets: Array[Int],
+      numRows: Int): (Array[(Int, Int)], RoaringBitmap) = {
+
     val bestSplitsBc: Broadcast[Array[Option[Split]]] =
       partitionInfos.sparkContext.broadcast(bestSplits)
-    val workerBitSubvectors: RDD[RoaringBitmap] = partitionInfos.map {
-      case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
-                         activeNodes: BitSet, fullImpurities: Array[ImpurityAggregatorSingle]) =>
+    val workerBitSubvectors = partitionInfos.map {
+      case PartitionInfo(columns: Array[FeatureVector], fullImpurities: Array[ImpurityAggregatorSingle]) =>
         val localBestSplits: Array[Option[Split]] = bestSplitsBc.value
         // localFeatureIndex[feature index] = index into PartitionInfo.columns
         val localFeatureIndex: Map[Int, Int] = columns.map(_.featureIndex).zipWithIndex.toMap
-        val bitSetForNodes: Iterator[RoaringBitmap] = activeNodes.iterator
-          .zip(localBestSplits.iterator).flatMap {
+        val bitSetForNodes = activeNodes.iterator.zip(localBestSplits.iterator).flatMap {
           case (nodeIndexInLevel: Int, Some(split: Split)) =>
             if (localFeatureIndex.contains(split.featureIndex)) {
               // This partition has the column (feature) used for this split.
               val fromOffset = nodeOffsets(nodeIndexInLevel)
               val toOffset = nodeOffsets(nodeIndexInLevel + 1)
               val colIndex: Int = localFeatureIndex(split.featureIndex)
-              Iterator(bitVectorFromSplit(columns(colIndex), fromOffset, toOffset, split, numRows))
+              val (numBitsNotSet, bv) = bitVectorFromSplit(columns(colIndex), fromOffset, toOffset, split, numRows)
+              Iterator(((nodeIndexInLevel, numBitsNotSet), bv))
             } else {
               Iterator()
             }
@@ -251,18 +280,20 @@ private[ml] object AltDT extends Logging {
             // split, by how many instances go left/right.
             Iterator()
         }
-        if (bitSetForNodes.isEmpty) {
-          new RoaringBitmap()
-        } else {
-          bitSetForNodes.reduce[RoaringBitmap] { (acc, bitv) => acc.or(bitv); acc }
+        val (indexAndOffsets, bitVectors) = bitSetForNodes.toArray.unzip
+        val totalBitVector = bitVectors.fold(new RoaringBitmap()) { (acc, bitv) =>
+          acc.or(bitv)
+          acc
         }
+        (indexAndOffsets, totalBitVector)
     }
-    val aggBitVector: RoaringBitmap = workerBitSubvectors.reduce { (acc, bitv) =>
+    val offsets = workerBitSubvectors.map(x => x._1).collect().flatten
+    val aggBitVector: RoaringBitmap = workerBitSubvectors.map(x => x._2).reduce { (acc, bitv) =>
       acc.or(bitv)
       acc
     }
     bestSplitsBc.unpersist()
-    aggBitVector
+    (offsets, aggBitVector)
   }
 
   /**
@@ -285,18 +316,20 @@ private[ml] object AltDT extends Logging {
                                         from: Int,
                                         to: Int,
                                         split: Split,
-                                        numRows: Int): RoaringBitmap = {
+                                        numRows: Int): (Int, RoaringBitmap) = {
     val bitv = new RoaringBitmap()
+    var count = 0
     var i = from
     while (i < to) {
       val value = col.values(i)
       val idx = col.indices(i)
       if (!split.shouldGoLeft(value)) {
         bitv.add(idx)
+        count += 1
       }
       i += 1
     }
-    bitv
+    (to - from - count, bitv)
   }
 
   /**
@@ -311,19 +344,11 @@ private[ml] object AltDT extends Logging {
    *                 all columns share this first level of sorting.
    *                 Within each node's group, each column is sorted based on feature value;
    *                 this second level of sorting differs across columns.
-   * @param nodeOffsets  Offsets into the columns indicating the first level of sorting (by node).
-   *                     The rows corresponding to node i are in the range
-   *                     [nodeOffsets(i), nodeOffsets(i+1)).
-   * @param activeNodes  Nodes which are active (still being split).
-   *                     Inactive nodes are known to be leafs in the final tree.
-   *                     TODO: Should this (and even nodeOffsets) not be stored in PartitionInfo,
-   *                           but instead on the driver?
    */
   private[impl] case class PartitionInfo(
-      columns: Array[FeatureVector],
-      nodeOffsets: Array[Int],
-      activeNodes: BitSet,
-      fullImpurityAggs: Array[ImpurityAggregatorSingle]) extends Serializable {
+                                          columns: Array[FeatureVector],
+                                          fullImpurityAggs: Array[ImpurityAggregatorSingle])
+    extends Serializable {
 
     // pre-allocated temporary buffers that we use to sort
     // instances in left and right children during update
@@ -335,9 +360,7 @@ private[ml] object AltDT extends Logging {
       "PartitionInfo(" +
         "  columns: {\n" +
         columns.mkString(",\n") +
-        "  },\n" +
-        s"  nodeOffsets: ${nodeOffsets.mkString(", ")},\n" +
-        s"  activeNodes: ${activeNodes.iterator.mkString(", ")},\n" +
+        "  }\n" +
         ")\n"
     }
 
@@ -358,43 +381,25 @@ private[ml] object AltDT extends Logging {
      *                    For instances at inactive (leaf) nodes, the value can be arbitrary.
      * @return Updated partition info
      */
-    def update(instanceBitVector: BitSet, newNumNodeOffsets: Int,
+    def update(instanceBitVector: BitSet, oldActiveNodes: BitSet, newNodeOffsets: Array[Array[Int]],
                labels: Array[Byte], metadata: AltDTMetadata): PartitionInfo = {
       // Create a 2-level representation of the new nodeOffsets (to be flattened).
       // These 2 levels correspond to original nodes and their children (if split).
-      val newNodeOffsets = nodeOffsets.map(Array(_))
       val newFullImpurityAggs = fullImpurityAggs.map(Array(_))
-
       val newColumns = columns.zipWithIndex.map { case (col, index) =>
         index match {
-          case 0 => first(col, instanceBitVector, metadata, labels, newNodeOffsets, newFullImpurityAggs)
-          case _ => rest(col, instanceBitVector, newNodeOffsets)
+          case 0 => first(col, instanceBitVector, oldActiveNodes, metadata, labels, newNodeOffsets, newFullImpurityAggs)
+          case _ => rest(col, instanceBitVector, oldActiveNodes, newNodeOffsets)
         }
         col
       }
 
-      // Identify the new activeNodes based on the 2-level representation of the new nodeOffsets.
-      val newActiveNodes = new BitSet(newNumNodeOffsets - 1)
-      var newNodeOffsetsIdx = 0
-      var i = 0
-      while (i < newNodeOffsets.length) {
-        val offsets = newNodeOffsets(i)
-        if (offsets.length == 2) {
-          newActiveNodes.set(newNodeOffsetsIdx)
-          newActiveNodes.set(newNodeOffsetsIdx + 1)
-          newNodeOffsetsIdx += 2
-        } else {
-          newNodeOffsetsIdx += 1
-        }
-        i += 1
-      }
-      PartitionInfo(newColumns, newNodeOffsets.flatten, newActiveNodes, newFullImpurityAggs.flatten)
+      PartitionInfo(newColumns, newFullImpurityAggs.flatten)
     }
 
 
     /**
      * Sort the very first column in the [[PartitionInfo.columns]]. While
-     * we sort the column, we also update [[PartitionInfo.nodeOffsets]]
      * (by modifying @param newNodeOffsets) and [[PartitionInfo.fullImpurityAggs]]
      * (by modifying @param newFullImpurityAggs).
      * @param col The very first column in [[PartitionInfo.columns]]
@@ -404,45 +409,19 @@ private[ml] object AltDT extends Logging {
      *                 new ImpurityAggregatorSingle
      */
     private def first(
-               col: FeatureVector,
-               instanceBitVector: BitSet,
-               metadata: AltDTMetadata,
-               labels: Array[Byte],
-               newNodeOffsets: Array[Array[Int]],
-               newFullImpurityAggs: Array[Array[ImpurityAggregatorSingle]]) = {
+                       col: FeatureVector,
+                       instanceBitVector: BitSet,
+                       activeNodes: BitSet,
+                       metadata: AltDTMetadata,
+                       labels: Array[Byte],
+                       newNodeOffsets: Array[Array[Int]],
+                       newFullImpurityAggs: Array[Array[ImpurityAggregatorSingle]]) = {
       activeNodes.iterator.foreach { nodeIdx =>
-        // WHAT TO OPTIMIZE:
-        // - try skipping numBitsSet
-        // - maybe uncompress bitmap
-        val from = nodeOffsets(nodeIdx)
-        val to = nodeOffsets(nodeIdx + 1)
-
-        // If this is the very first time we split,
-        // we don't use rangeIndices to count the number of bits set;
-        // the entire bit vector will be used, so getCardinality
-        // will give us the same result more cheaply.
-        val numBitsSet = {
-          if (nodeOffsets.length == 2) instanceBitVector.cardinality()
-          else {
-            var count = 0
-            var i = from
-            while (i < to) {
-              if (instanceBitVector.get(col.indices(i))) {
-                count += 1
-              }
-              i += 1
-            }
-            count
-          }
-        }
-
-        val numBitsNotSet = to - from - numBitsSet // number of instances splitting left
-        val oldOffset = newNodeOffsets(nodeIdx).head
-
-        // If numBitsNotSet or numBitsSet equals 0, then this node was not split,
-        // so we do not need to update its part of the column. Otherwise, we update it.
-        if (numBitsNotSet != 0 && numBitsSet != 0) {
-          newNodeOffsets(nodeIdx) = Array(oldOffset, oldOffset + numBitsNotSet)
+        val offsets = newNodeOffsets(nodeIdx)
+        if (offsets.length == 2) {
+          val from = offsets(0)
+          val middle = offsets(1)
+          val to = newNodeOffsets(nodeIdx + 1)(0)
 
           val leftImpurity = metadata.createImpurityAggregator()
           val rightImpurity = metadata.createImpurityAggregator()
@@ -461,8 +440,8 @@ private[ml] object AltDT extends Logging {
           // into @tempVals and @tempIndices either:
           // 1) in the [from, numBitsNotSet) range if the bit is false, or
           // 2) in the [numBitsNotSet, to) range if the bit is true.
-          var (leftInstanceIdx, rightInstanceIdx) = (from, from + numBitsNotSet)
-          var idx = from
+          var (leftInstanceIdx, rightInstanceIdx) = (from, middle)
+          var idx = leftInstanceIdx
           while (idx < to) {
             val indexForVal = col.indices(idx)
             val bit = instanceBitVector.get(indexForVal)
@@ -508,43 +487,24 @@ private[ml] object AltDT extends Logging {
      *                    For instances at inactive (leaf) nodes, the value can be arbitrary.
      * @return Updated partition info
      */
-    def update(instanceBitVector: BitSet, newNumNodeOffsets: Int,
+    def update(instanceBitVector: BitSet, oldActiveNodes: BitSet, newNodeOffsets: Array[Array[Int]],
                labels: Array[Double], metadata: AltDTMetadata): PartitionInfo = {
-      // Create a 2-level representation of the new nodeOffsets (to be flattened).
-      // These 2 levels correspond to original nodes and their children (if split).
-      val newNodeOffsets = nodeOffsets.map(Array(_))
       val newFullImpurityAggs = fullImpurityAggs.map(Array(_))
 
       val newColumns = columns.zipWithIndex.map { case (col, index) =>
         index match {
-          case 0 => first(col, instanceBitVector, metadata, labels, newNodeOffsets, newFullImpurityAggs)
-          case _ => rest(col, instanceBitVector, newNodeOffsets)
+          case 0 => first(col, instanceBitVector, oldActiveNodes, metadata, labels, newNodeOffsets, newFullImpurityAggs)
+          case _ => rest(col, instanceBitVector, oldActiveNodes, newNodeOffsets)
         }
         col
       }
 
-      // Identify the new activeNodes based on the 2-level representation of the new nodeOffsets.
-      val newActiveNodes = new BitSet(newNumNodeOffsets - 1)
-      var newNodeOffsetsIdx = 0
-      var i = 0
-      while (i < newNodeOffsets.length) {
-        val offsets = newNodeOffsets(i)
-        if (offsets.length == 2) {
-          newActiveNodes.set(newNodeOffsetsIdx)
-          newActiveNodes.set(newNodeOffsetsIdx + 1)
-          newNodeOffsetsIdx += 2
-        } else {
-          newNodeOffsetsIdx += 1
-        }
-        i += 1
-      }
-      PartitionInfo(newColumns, newNodeOffsets.flatten, newActiveNodes, newFullImpurityAggs.flatten)
+      PartitionInfo(newColumns, newFullImpurityAggs.flatten)
     }
 
 
     /**
      * Sort the very first column in the [[PartitionInfo.columns]]. While
-     * we sort the column, we also update [[PartitionInfo.nodeOffsets]]
      * (by modifying @param newNodeOffsets) and [[PartitionInfo.fullImpurityAggs]]
      * (by modifying @param newFullImpurityAggs).
      * @param col The very first column in [[PartitionInfo.columns]]
@@ -556,43 +516,16 @@ private[ml] object AltDT extends Logging {
     private def first(
                        col: FeatureVector,
                        instanceBitVector: BitSet,
+                       activeNodes: BitSet,
                        metadata: AltDTMetadata,
                        labels: Array[Double],
                        newNodeOffsets: Array[Array[Int]],
                        newFullImpurityAggs: Array[Array[ImpurityAggregatorSingle]]) = {
       activeNodes.iterator.foreach { nodeIdx =>
-        // WHAT TO OPTIMIZE:
-        // - try skipping numBitsSet
-        // - maybe uncompress bitmap
-        val from = nodeOffsets(nodeIdx)
-        val to = nodeOffsets(nodeIdx + 1)
-
-        // If this is the very first time we split,
-        // we don't use rangeIndices to count the number of bits set;
-        // the entire bit vector will be used, so getCardinality
-        // will give us the same result more cheaply.
-        val numBitsSet = {
-          if (nodeOffsets.length == 2) instanceBitVector.cardinality()
-          else {
-            var count = 0
-            var i = from
-            while (i < to) {
-              if (instanceBitVector.get(col.indices(i))) {
-                count += 1
-              }
-              i += 1
-            }
-            count
-          }
-        }
-
-        val numBitsNotSet = to - from - numBitsSet // number of instances splitting left
-      val oldOffset = newNodeOffsets(nodeIdx).head
-
-        // If numBitsNotSet or numBitsSet equals 0, then this node was not split,
-        // so we do not need to update its part of the column. Otherwise, we update it.
-        if (numBitsNotSet != 0 && numBitsSet != 0) {
-          newNodeOffsets(nodeIdx) = Array(oldOffset, oldOffset + numBitsNotSet)
+        val offsets = newNodeOffsets(nodeIdx)
+        if (offsets.length == 2) {
+          val from = offsets(0)
+          val to = newNodeOffsets(nodeIdx + 1)(0)
 
           val leftImpurity = metadata.createImpurityAggregator()
           val rightImpurity = metadata.createImpurityAggregator()
@@ -611,7 +544,7 @@ private[ml] object AltDT extends Logging {
           // into @tempVals and @tempIndices either:
           // 1) in the [from, numBitsNotSet) range if the bit is false, or
           // 2) in the [numBitsNotSet, to) range if the bit is true.
-          var (leftInstanceIdx, rightInstanceIdx) = (from, from + numBitsNotSet)
+          var (leftInstanceIdx, rightInstanceIdx) = (from, offsets(1))
           var idx = from
           while (idx < to) {
             val indexForVal = col.indices(idx)
@@ -643,7 +576,6 @@ private[ml] object AltDT extends Logging {
 
     /**
      * Sort the remaining columns in the [[PartitionInfo.columns]]. Since
-     * we already computed [[PartitionInfo.nodeOffsets]] and
      * [[PartitionInfo.fullImpurityAggs]] while we sorted the first column,
      * we skip the computation for those here.
      * @param col The very first column in [[PartitionInfo.columns]]
@@ -653,19 +585,18 @@ private[ml] object AltDT extends Logging {
     private def rest(
                       col: FeatureVector,
                       instanceBitVector: BitSet,
+                      activeNodes: BitSet,
                       newNodeOffsets: Array[Array[Int]]) = {
       activeNodes.iterator.foreach { nodeIdx =>
-        val from = nodeOffsets(nodeIdx)
-        val to = nodeOffsets(nodeIdx + 1)
-        val newOffsets = newNodeOffsets(nodeIdx)
-
-        // We determined that this node was split in first()
-        if (newOffsets.length == 2) {
-          val numBitsNotSet = newOffsets(1) - newOffsets(0)
+        val offsets = newNodeOffsets(nodeIdx)
+        if (offsets.length == 2) {
+          val from = offsets(0)
+          val middle = offsets(1)
+          val to = newNodeOffsets(nodeIdx + 1)(0)
 
           // Same as above, but we don't compute the left and right impurities for
           // the resulitng child nodes
-          var (leftInstanceIdx, rightInstanceIdx) = (from, from + numBitsNotSet)
+          var (leftInstanceIdx, rightInstanceIdx) = (from, middle)
           var idx = from
           while (idx < to) {
             val indexForVal = col.indices(idx)
@@ -687,7 +618,6 @@ private[ml] object AltDT extends Logging {
         }
       }
     }
-
   }
 
    /**
