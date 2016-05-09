@@ -358,7 +358,7 @@ private[ml] object AltDT extends Logging {
      *                    For instances at inactive (leaf) nodes, the value can be arbitrary.
      * @return Updated partition info
      */
-    def update(instanceBitVector: RoaringBitmap, newNumNodeOffsets: Int,
+    def update(instanceBitVector: BitSet, newNumNodeOffsets: Int,
                labels: Array[Byte], metadata: AltDTMetadata): PartitionInfo = {
       // Create a 2-level representation of the new nodeOffsets (to be flattened).
       // These 2 levels correspond to original nodes and their children (if split).
@@ -405,7 +405,7 @@ private[ml] object AltDT extends Logging {
      */
     private def first(
                col: FeatureVector,
-               instanceBitVector: RoaringBitmap,
+               instanceBitVector: BitSet,
                metadata: AltDTMetadata,
                labels: Array[Byte],
                newNodeOffsets: Array[Array[Int]],
@@ -422,12 +422,12 @@ private[ml] object AltDT extends Logging {
         // the entire bit vector will be used, so getCardinality
         // will give us the same result more cheaply.
         val numBitsSet = {
-          if (nodeOffsets.length == 2) instanceBitVector.getCardinality
+          if (nodeOffsets.length == 2) instanceBitVector.cardinality()
           else {
             var count = 0
             var i = from
             while (i < to) {
-              if (instanceBitVector.contains(col.indices(i))) {
+              if (instanceBitVector.get(col.indices(i))) {
                 count += 1
               }
               i += 1
@@ -465,7 +465,7 @@ private[ml] object AltDT extends Logging {
           var idx = from
           while (idx < to) {
             val indexForVal = col.indices(idx)
-            val bit = instanceBitVector.contains(indexForVal)
+            val bit = instanceBitVector.get(indexForVal)
             val label = labels(indexForVal)
             if (bit) {
               rightImpurity.update(label)
@@ -508,7 +508,7 @@ private[ml] object AltDT extends Logging {
      *                    For instances at inactive (leaf) nodes, the value can be arbitrary.
      * @return Updated partition info
      */
-    def update(instanceBitVector: RoaringBitmap, newNumNodeOffsets: Int,
+    def update(instanceBitVector: BitSet, newNumNodeOffsets: Int,
                labels: Array[Double], metadata: AltDTMetadata): PartitionInfo = {
       // Create a 2-level representation of the new nodeOffsets (to be flattened).
       // These 2 levels correspond to original nodes and their children (if split).
@@ -555,7 +555,7 @@ private[ml] object AltDT extends Logging {
      */
     private def first(
                        col: FeatureVector,
-                       instanceBitVector: RoaringBitmap,
+                       instanceBitVector: BitSet,
                        metadata: AltDTMetadata,
                        labels: Array[Double],
                        newNodeOffsets: Array[Array[Int]],
@@ -572,12 +572,12 @@ private[ml] object AltDT extends Logging {
         // the entire bit vector will be used, so getCardinality
         // will give us the same result more cheaply.
         val numBitsSet = {
-          if (nodeOffsets.length == 2) instanceBitVector.getCardinality
+          if (nodeOffsets.length == 2) instanceBitVector.cardinality()
           else {
             var count = 0
             var i = from
             while (i < to) {
-              if (instanceBitVector.contains(col.indices(i))) {
+              if (instanceBitVector.get(col.indices(i))) {
                 count += 1
               }
               i += 1
@@ -615,7 +615,7 @@ private[ml] object AltDT extends Logging {
           var idx = from
           while (idx < to) {
             val indexForVal = col.indices(idx)
-            val bit = instanceBitVector.contains(indexForVal)
+            val bit = instanceBitVector.get(indexForVal)
             val label = labels(indexForVal)
             if (bit) {
               rightImpurity.update(label)
@@ -652,7 +652,7 @@ private[ml] object AltDT extends Logging {
      */
     private def rest(
                       col: FeatureVector,
-                      instanceBitVector: RoaringBitmap,
+                      instanceBitVector: BitSet,
                       newNodeOffsets: Array[Array[Int]]) = {
       activeNodes.iterator.foreach { nodeIdx =>
         val from = nodeOffsets(nodeIdx)
@@ -669,7 +669,7 @@ private[ml] object AltDT extends Logging {
           var idx = from
           while (idx < to) {
             val indexForVal = col.indices(idx)
-            val bit = instanceBitVector.contains(indexForVal)
+            val bit = instanceBitVector.get(indexForVal)
             if (bit) {
               tempVals(rightInstanceIdx) = col.values(idx)
               tempIndices(rightInstanceIdx) = indexForVal

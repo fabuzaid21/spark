@@ -98,7 +98,12 @@ object AltDTRegression {
         // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right
         val aggBitVector: RoaringBitmap = AltDT.aggregateBitVector(partitionInfos, splits, numRows)
         val newPartitionInfos = partitionInfos.map { partitionInfo =>
-          partitionInfo.update(aggBitVector, numNodeOffsets, labelsBc.value, metadata)
+          val bv = new BitSet(numRows)
+          val iter = aggBitVector.getIntIterator
+          while(iter.hasNext) {
+            bv.set(iter.next)
+          }
+          partitionInfo.update(bv, numNodeOffsets, labelsBc.value, metadata)
         }
         // TODO: remove.  For some reason, this is needed to make things work.
         // Probably messing up somewhere above...
