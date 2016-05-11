@@ -27,6 +27,7 @@ import org.apache.spark.mllib.tree.impurity.{EntropyCalculator, Entropy, Gini}
 import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.util.collection.BitSet
+import java.util.{HashMap => JavaHashMap}
 
 import scala.util.Random
 
@@ -163,7 +164,9 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val bitVector = new BitSet(numRows)
     bitVector.set(1)
     bitVector.set(3)
-    val activeNodeMap = Map((0, false) -> 0, (0, true) -> 1)
+    val activeNodeMap = new JavaHashMap[Int, Int]()
+    activeNodeMap.put(0, 0)
+    activeNodeMap.put(1, 1)
 
     // for these tests, use the activeNodes for nodeSplitBitVector
     val newInfo = info.update(bitVector, activeNodeMap, labels, metadata)
@@ -190,7 +193,11 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val bitVector2 = new BitSet(numRows)
     bitVector2.set(2) // 2 goes to the right
     bitVector2.set(3) // 3 goes to the right
-    val activeNodeMap2 = Map((0, false) -> 0, (0, true) -> 1, (1, false) -> 2, (1, true) -> 3)
+    val activeNodeMap2 = new JavaHashMap[Int, Int]()
+    activeNodeMap2.put(0, 0)
+    activeNodeMap2.put(1, 1)
+    activeNodeMap2.put(2, 2)
+    activeNodeMap2.put(3, 3)
 
     val newInfo2 = newInfo.update(bitVector2, activeNodeMap2, labels, metadata)
 

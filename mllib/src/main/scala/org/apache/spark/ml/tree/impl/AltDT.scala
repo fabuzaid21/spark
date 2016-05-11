@@ -29,6 +29,7 @@ import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
 import org.apache.spark.util.collection.{BitSet, SortDataFormat, Sorter}
 import org.roaringbitmap.RoaringBitmap
+import java.util.{HashMap => JavaHashMap}
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -177,17 +178,17 @@ private[ml] object AltDT extends Logging {
 
   private[impl] def computeActiveNodeMap(
                                           bestSplitsAndGains: Array[(Option[Split], ImpurityStats)],
-                                          minInfoGain: Double): Map[(Int, Boolean), Int] = {
-    val activeNodeMap = scala.collection.mutable.Map[(Int, Boolean), Int]()
+                                          minInfoGain: Double): JavaHashMap[Int, Int] = {
+    val activeNodeMap = new JavaHashMap[Int, Int]()
     var newNodeIdx = 0
     bestSplitsAndGains.zipWithIndex.foreach { case ((split, stats), nodeIdx) =>
       if (split.nonEmpty && stats.gain > minInfoGain) {
-        activeNodeMap((nodeIdx, false)) = newNodeIdx
-        activeNodeMap((nodeIdx, true)) = newNodeIdx + 1
+        activeNodeMap.put(nodeIdx << 1, newNodeIdx)
+        activeNodeMap.put((nodeIdx << 1) + 1, newNodeIdx + 1)
         newNodeIdx += 2
       }
     }
-    activeNodeMap.toMap
+    activeNodeMap
   }
 
   /**
@@ -389,7 +390,7 @@ private[ml] object AltDT extends Logging {
      *                    For instances at inactive (leaf) nodes, the value can be arbitrary.
      * @return Updated partition info
      */
-    def update(instanceBitVector: BitSet, activeNodeMap: Map[(Int, Boolean), Int],
+    def update(instanceBitVector: BitSet, activeNodeMap: JavaHashMap[Int, Int],
                labels: Array[Byte], metadata: AltDTMetadata): PartitionInfo = {
       val newFullImpurityAggs = Array.fill[ImpurityAggregatorSingle](activeNodeMap.size)(metadata.createImpurityAggregator())
       columns.zipWithIndex.foreach { case (col, index) =>
@@ -417,14 +418,18 @@ private[ml] object AltDT extends Logging {
                        col: FeatureVector,
                        instanceBitVector: BitSet,
                        newFullImpurityAggs: Array[ImpurityAggregatorSingle],
-                       activeNodeMap: Map[(Int, Boolean), Int],
+                       activeNodeMap: JavaHashMap[Int, Int],
                        metadata: AltDTMetadata,
                        labels: Array[Byte]) = {
       var idx = 0
       while (idx < col.indices.length) {
         val indexForVal = col.indices(idx)
-        val bit = instanceBitVector.get(indexForVal)
-        val nodeIndex = activeNodeMap.getOrElse((col.nodeIndices(idx), bit), -1) // -1 means that this node was not split
+        var key = col.nodeIndices(idx) << 1
+        if (instanceBitVector.get(indexForVal)) {
+          key += 1
+        }
+        // -1 means that this node was not split
+        val nodeIndex = if (activeNodeMap.containsKey(key)) activeNodeMap.get(key) else -1
         if (nodeIndex >= 0) {
           val label = labels(indexForVal)
           newFullImpurityAggs(nodeIndex).update(label)
@@ -451,7 +456,7 @@ private[ml] object AltDT extends Logging {
      *                    For instances at inactive (leaf) nodes, the value can be arbitrary.
      * @return Updated partition info
      */
-    def update(instanceBitVector: BitSet, activeNodeMap: Map[(Int, Boolean), Int],
+    def update(instanceBitVector: BitSet, activeNodeMap: JavaHashMap[Int, Int],
                labels: Array[Double], metadata: AltDTMetadata): PartitionInfo = {
       val newFullImpurityAggs = Array.fill[ImpurityAggregatorSingle](activeNodeMap.size)(metadata.createImpurityAggregator())
       columns.zipWithIndex.foreach { case (col, index) =>
@@ -479,14 +484,18 @@ private[ml] object AltDT extends Logging {
                        col: FeatureVector,
                        instanceBitVector: BitSet,
                        newFullImpurityAggs: Array[ImpurityAggregatorSingle],
-                       activeNodeMap: Map[(Int, Boolean), Int],
+                       activeNodeMap: JavaHashMap[Int, Int],
                        metadata: AltDTMetadata,
                        labels: Array[Double]) = {
       var idx = 0
       while (idx < col.indices.length) {
         val indexForVal = col.indices(idx)
-        val bit = instanceBitVector.get(indexForVal)
-        val nodeIndex = activeNodeMap.getOrElse((col.nodeIndices(idx), bit), -1) // -1 means that this node was not split
+        var key = col.nodeIndices(idx) << 1
+        if (instanceBitVector.get(indexForVal)) {
+          key += 1
+        }
+        // -1 means that this node was not split
+        val nodeIndex = if (activeNodeMap.containsKey(key)) activeNodeMap.get(key) else -1
         if (nodeIndex >= 0) {
           val label = labels(indexForVal)
           newFullImpurityAggs(nodeIndex).update(label)
@@ -504,13 +513,16 @@ private[ml] object AltDT extends Logging {
     private def rest(
                       col: FeatureVector,
                       instanceBitVector: BitSet,
-                      activeNodeMap: Map[(Int, Boolean), Int]) = {
+                      activeNodeMap: JavaHashMap[Int, Int]) = {
       var idx = 0
       while (idx < col.indices.length) {
         val indexForVal = col.indices(idx)
-        val bit = instanceBitVector.get(indexForVal)
-        col.nodeIndices(idx) =
-          activeNodeMap.getOrElse((col.nodeIndices(idx), bit), -1) // -1 means that this node was not split
+        var key = col.nodeIndices(idx) << 1
+        if (instanceBitVector.get(indexForVal)) {
+          key += 1
+        }
+        col.nodeIndices(idx) = if (activeNodeMap.containsKey(key)) activeNodeMap.get(key)
+                               else -1 // -1 means that this node was not split
         idx += 1
       }
     }
