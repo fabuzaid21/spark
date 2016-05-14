@@ -17,19 +17,19 @@
 
 package org.apache.spark.ml.tree.impl
 
-import org.apache.spark.SparkFunSuite
-import org.apache.spark.ml.regression.DecisionTreeRegressor
-import org.apache.spark.ml.tree._
-import org.apache.spark.ml.tree.impl.AltDT.{PartitionInfo, FeatureVector, AltDTMetadata}
-import org.apache.spark.mllib.linalg.Vectors
-import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.tree.impurity.{EntropyCalculator, Entropy, Gini}
-import org.apache.spark.mllib.tree.model.ImpurityStats
-import org.apache.spark.mllib.util.MLlibTestSparkContext
-import org.apache.spark.util.collection.BitSet
-import java.util.{HashMap => JavaHashMap}
+ import java.util.{HashMap => JavaHashMap}
 
-import scala.util.Random
+ import org.apache.spark.SparkFunSuite
+ import org.apache.spark.ml.regression.DecisionTreeRegressor
+ import org.apache.spark.ml.tree._
+ import org.apache.spark.ml.tree.impl.AltDT.{AltDTMetadata, FeatureVector, PartitionInfo}
+ import org.apache.spark.mllib.linalg.Vectors
+ import org.apache.spark.mllib.regression.LabeledPoint
+ import org.apache.spark.mllib.tree.impurity.{EntropyCalculator, Gini, Entropy}
+ import org.apache.spark.mllib.tree.model.ImpurityStats
+ import org.apache.spark.mllib.util.MLlibTestSparkContext
+ import org.apache.spark.util.collection.BitSet
+ import scala.util.Random
 
 /**
  * Test suite for [[AltDT]].
@@ -116,17 +116,14 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
   /* * * * * * * * * * * Helper classes * * * * * * * * * * */
 
   test("FeatureVector") {
-    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map(1 -> 3))
-    val emptyAgg = metadata.createImpurityAggregator()
-
-    val v = new FeatureVector(1, 0, Array(0.1, 0.3, 0.7), Array(1, 2, 0), Array(emptyAgg), Array(0, 0, 0))
+    val v = new FeatureVector(1, 0, Array(0.1, 0.3, 0.7), Array(1, 2, 0), Array(0, 0, 0))
 
     val vCopy = v.deepCopy()
     vCopy.values(0) = 1000
     assert(v.values(0) !== vCopy.values(0))
 
     val original = Array(0.7, 0.1, 0.3)
-    val v2 = FeatureVector.fromOriginal(1, 0, original, emptyAgg)
+    val v2 = FeatureVector.fromOriginal(1, 0, original)
     assert(v === v2)
   }
 
@@ -138,7 +135,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val featureIndex = 3
     val featureArity = 0
     val fvSorted =
-      FeatureVector.fromOriginal(featureIndex, featureArity, col, null)
+      FeatureVector.fromOriginal(featureIndex, featureArity, col)
     assert(fvSorted.featureIndex === featureIndex)
     assert(fvSorted.featureArity === featureArity)
     assert(fvSorted.values.deep === values.deep)
@@ -151,13 +148,15 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map(1 -> 3))
     val fullImpurityAgg = metadata.createImpurityAggregator()
     labels.foreach(label => fullImpurityAgg.update(label))
-    val col1 = FeatureVector.fromOriginal(0, 0, Array(0.8, 0.2, 0.1, 0.6), fullImpurityAgg)
-    val col2 = FeatureVector.fromOriginal(1, 3, Array(0, 1, 0, 2), fullImpurityAgg)
+    val col1 = FeatureVector.fromOriginal(0, 0, Array(0.8, 0.2, 0.1, 0.6))
+    val values = Array(0.0, 1.0, 0.0, 2.0)
+    val aggStats = FeatureVector.initAggStats(values, labels, 3, metadata)
+    val col2 = FeatureVector.fromOriginal(1, 3, values, Array(aggStats))
 
     assert(col1.values.length === numRows)
-    assert(col2.values.length === numRows)
+    assert(col2.compressedVals.length === values.distinct.length)
 
-    val info = PartitionInfo(Array(col1, col2))
+    val info = PartitionInfo(Array(col1, col2), Array(fullImpurityAgg))
 
     // Create bitVector for splitting the 4 rows: L, R, L, R
     // New groups are {0, 2}, {1, 3}
@@ -180,11 +179,14 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val expectedFullImpurityAggs1 = Array(leftImpurityAgg, rightImpurityAgg)
 
     assert(newInfo.columns.length === 2)
+    assert(newInfo.fullImpurityAggs.zip(expectedFullImpurityAggs1).forall { case (x, y) =>
+      x.stats.sameElements(y.stats)
+    })
     val expectedCol1a = new FeatureVector(0, 0, Array(0.1, 0.2, 0.6, 0.8), Array(2, 1, 3, 0),
-      expectedFullImpurityAggs1, Array(0, 1, 1, 0))
+      Array(0, 1, 1, 0))
 
-    val expectedCol1b = new FeatureVector(1, 3, Array(0, 0, 1, 2), Array(0, 2, 1, 3),
-      expectedFullImpurityAggs1, Array(0, 0, 1, 1))
+    val expectedCol1b = new FeatureVector(1, 3, null, Array(0, 2, 1, 3),
+      Array(0, 0, 1, 1), null, Array((0.0, 2), (1.0, 1), (2.0, 1)), true)
 
     assert(newInfo.columns(0) === expectedCol1a)
     assert(newInfo.columns(1) === expectedCol1b)
@@ -213,152 +215,182 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val expectedFullImpurityAggs2 = Array(impurityAgg1, impurityAgg2, impurityAgg3, impurityAgg4)
 
     assert(newInfo2.columns.length === 2)
+    assert(newInfo2.fullImpurityAggs.zip(expectedFullImpurityAggs2).forall { case (x, y) =>
+      x.stats.sameElements(y.stats)
+    })
+
     val expectedCol2a = new FeatureVector(0, 0, Array(0.1, 0.2, 0.6, 0.8), Array(2, 1, 3, 0),
-      expectedFullImpurityAggs2, Array(1, 2, 3, 0))
-    val expectedCol2b = new FeatureVector(1, 3, Array(0, 0, 1, 2), Array(0, 2, 1, 3),
-      expectedFullImpurityAggs2, Array(0, 1, 2, 3))
+      Array(1, 2, 3, 0))
+    val expectedCol2b = new FeatureVector(1, 3, null, Array(0, 2, 1, 3),
+      Array(0, 1, 2, 3), null, Array((0.0, 2), (1.0, 1), (2.0, 1)), true)
     assert(newInfo2.columns(0) === expectedCol2a)
     assert(newInfo2.columns(1) === expectedCol2b)
   }
 
-//  /* * * * * * * * * * * Choosing Splits  * * * * * * * * * * */
-//
+  /* * * * * * * * * * * Choosing Splits  * * * * * * * * * * */
+
 //  test("computeBestSplits") {
 //    // TODO
 //  }
-//
-//  test("chooseSplit: choose correct type of split") {
-//    val labels = Array(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0)
-//    val labelsAsBytes = labels.map(_.toByte)
-//    val fromOffset = 1
-//    val toOffset = 4
-//    val impurity = Entropy
-//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map(1 -> 3))
-//    val fullImpurityAgg = metadata.createImpurityAggregator()
-//    labels.foreach(label => fullImpurityAgg.update(label))
-//
-//    val col1 = FeatureVector.fromOriginal(featureIndex = 0, featureArity = 0,
-//      values = Array(0.8, 0.1, 0.1, 0.2, 0.3, 0.5, 0.6))
-//    val (split1, _) = AltDTClassification.chooseSplit(col1, labelsAsBytes, fromOffset, toOffset, fullImpurityAgg, metadata)
-//    assert(split1.nonEmpty && split1.get.isInstanceOf[ContinuousSplit])
-//
-//    val col2 = FeatureVector.fromOriginal(featureIndex = 1, featureArity = 3,
-//      values = Array(0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0))
-//    val (split2, _) = AltDTRegression.chooseSplit(col2, labels, fromOffset, toOffset, fullImpurityAgg, metadata)
-//    assert(split2.nonEmpty && split2.get.isInstanceOf[CategoricalSplit])
-//  }
-//
-//  test("chooseOrderedCategoricalSplit: basic case") {
-//    val featureIndex = 0
-//    val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
-//    val featureArity = values.max.toInt + 1
-//
-//    def testHelper(
-//        labels: Array[Byte],
-//        expectedLeftCategories: Array[Double],
-//        expectedLeftStats: Array[Double],
-//        expectedRightStats: Array[Double]): Unit = {
-//      val expectedRightCategories = Range(0, featureArity)
-//        .filter(c => !expectedLeftCategories.contains(c)).map(_.toDouble).toArray
-//      val impurity = Entropy
-//      val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0,
-//        impurity, Map.empty[Int, Int])
-//      val (split, stats) =
-//        AltDTClassification.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray,
-//          labels, 0, values.length, metadata, featureArity)
-//      split match {
-//        case Some(s: CategoricalSplit) =>
-//          assert(s.featureIndex === featureIndex)
-//          assert(s.leftCategories === expectedLeftCategories)
-//          assert(s.rightCategories === expectedRightCategories)
-//        case _ =>
-//          throw new AssertionError(
-//            s"Expected CategoricalSplit but got ${split.getClass.getSimpleName}")
-//      }
-//      val fullImpurityStatsArray =
-//        Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-//      val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
-//      assert(stats.gain === fullImpurity)
-//      assert(stats.impurity === fullImpurity)
-//      assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
-//      assert(stats.leftImpurityCalculator.stats === expectedLeftStats)
-//      assert(stats.rightImpurityCalculator.stats === expectedRightStats)
-//      assert(stats.valid)
-//    }
-//
-//    val labels1 = Array(0, 0, 1, 1, 1, 1, 1).map(_.toByte)
-//    testHelper(labels1, Array(0.0), Array(2.0, 0.0), Array(0.0, 5.0))
-//
-//    val labels2 = Array(0, 0, 0, 1, 1, 1, 1).map(_.toByte)
-//    testHelper(labels2, Array(0.0, 1.0), Array(3.0, 0.0), Array(0.0, 4.0))
-//  }
-//
-//  test("chooseOrderedCategoricalSplit: return bad split if we should not split") {
-//    val featureIndex = 0
-//    val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
-//    val featureArity = values.max.toInt + 1
-//
-//    val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
-//
-//    val impurity = Entropy
-//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
-//      Map(featureIndex -> featureArity))
-//    val (split, stats) =
-//      AltDTRegression.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray,
-//        labels, 0, values.length, metadata, featureArity)
-//    assert(split.isEmpty)
-//    val fullImpurityStatsArray =
-//      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-//    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
-//    assert(stats.gain === 0.0)
-//    assert(stats.impurity === fullImpurity)
-//    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
-//    assert(stats.valid)
-//  }
-//
-//  test("chooseUnorderedCategoricalSplit: basic case") {
-//    val featureIndex = 0
-//    val featureArity = 4
-//    val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
-//    val labels = Array(0.0, 0.0, 1.0, 1.0, 2.0)
-//    val impurity = Entropy
-//    val metadata = new AltDTMetadata(numClasses = 3, maxBins = 16, minInfoGain = 0.0, impurity,
-//      Map(featureIndex -> featureArity))
-//    val allSplits = metadata.getUnorderedSplits(featureIndex)
-//    val (split, _) = AltDTRegression.chooseUnorderedCategoricalSplit(featureIndex, values, values.indices.toArray,
-//      labels, 0, values.length, metadata, featureArity, allSplits)
-//    split match {
-//      case Some(s: CategoricalSplit) =>
-//        assert(s.featureIndex === featureIndex)
-//        assert(s.leftCategories.toSet === Set(0.0, 2.0))
-//        assert(s.rightCategories.toSet === Set(1.0, 3.0))
-//        // TODO: test correctness of stats
-//      case _ =>
-//        throw new AssertionError(
-//          s"Expected CategoricalSplit but got ${split.getClass.getSimpleName}")
-//    }
-//  }
-//
-//  test("chooseUnorderedCategoricalSplit: return bad split if we should not split") {
-//    val featureIndex = 0
-//    val featureArity = 4
-//    val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
-//    val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0).map(_.toByte)
-//    val impurity = Entropy
-//    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
-//      Map(featureIndex -> featureArity))
-//    val (split, stats) =
-//      AltDTClassification.chooseOrderedCategoricalSplit(featureIndex, values, values.indices.toArray,
-//        labels, 0, values.length, metadata, featureArity)
-//    assert(split.isEmpty)
-//    val fullImpurityStatsArray =
-//      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-//    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
-//    assert(stats.gain === 0.0)
-//    assert(stats.impurity === fullImpurity)
-//    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
-//    assert(stats.valid)
-//  }
+
+  test("chooseSplit: choose correct type of split") {
+    val labels = Array(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0)
+    val labelsAsBytes = labels.map(_.toByte)
+    val impurity = Entropy
+    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity, Map(1 -> 3))
+    val fullImpurityAgg = metadata.createImpurityAggregator()
+    labels.foreach(label => fullImpurityAgg.update(label))
+
+    val col1 = FeatureVector.fromOriginal(featureIndex = 0, featureArity = 0,
+      values = Array(0.8, 0.1, 0.1, 0.2, 0.3, 0.5, 0.6))
+    val splits1  = AltDTClassification.chooseSplitsForActiveNodes(col1, 1, labelsAsBytes, Array(fullImpurityAgg), metadata)
+    assert(splits1.length == 1)
+    val split1 = splits1(0)._1
+    assert(split1.nonEmpty && split1.get.isInstanceOf[ContinuousSplit])
+
+    val featureArity = 3
+    val values2 = Array(0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0)
+    val aggStats = Array.tabulate[ImpurityAggregatorSingle](featureArity)(
+      _ => metadata.createImpurityAggregator())
+    var i = 0
+    while (i < labels.length) {
+      val cat = values2(i)
+      val label = labels(i)
+      aggStats(cat.toInt).update(label)
+      i += 1
+    }
+    val col2 = FeatureVector.fromOriginal(featureIndex = 1, featureArity = featureArity,
+      values = values2, Array(aggStats))
+    val splits2 = AltDTRegression.chooseSplitsForActiveNodes(col2, 1, labels, Array(fullImpurityAgg), metadata)
+    assert(splits2.length == 1)
+    val split2 = splits2(0)._1
+    assert(split2.nonEmpty && split2.get.isInstanceOf[CategoricalSplit])
+  }
+
+  test("chooseOrderedCategoricalSplit: basic case") {
+    val featureIndex = 0
+    val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
+    val featureArity = values.max.toInt + 1
+    val impurity = Entropy
+    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0,
+      impurity, Map(0 -> featureArity))
+
+    def testHelper(
+        labels: Array[Byte],
+        aggStats: Array[ImpurityAggregatorSingle],
+        expectedLeftCategories: Array[Double],
+        expectedLeftStats: Array[Double],
+        expectedRightStats: Array[Double]): Unit = {
+      val expectedRightCategories = Range(0, featureArity)
+        .filter(c => !expectedLeftCategories.contains(c)).map(_.toDouble).toArray
+      val fullImpurityAgg = metadata.createImpurityAggregator()
+      aggStats.foreach(agg => fullImpurityAgg.add(agg))
+      val (split, stats) =
+        AltDTClassification.chooseOrderedCategoricalSplit(featureIndex, aggStats, fullImpurityAgg,
+          metadata, featureArity)
+      split match {
+        case Some(s: CategoricalSplit) =>
+          assert(s.featureIndex === featureIndex)
+          assert(s.leftCategories === expectedLeftCategories)
+          assert(s.rightCategories === expectedRightCategories)
+        case _ =>
+          throw new AssertionError(
+            s"Expected CategoricalSplit but got ${split.getClass.getSimpleName}")
+      }
+      val fullImpurityStatsArray =
+        Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
+      val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
+      assert(stats.gain === fullImpurity)
+      assert(stats.impurity === fullImpurity)
+      assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+      assert(stats.leftImpurityCalculator.stats === expectedLeftStats)
+      assert(stats.rightImpurityCalculator.stats === expectedRightStats)
+      assert(stats.valid)
+    }
+
+    val labels1 = Array(0, 0, 1, 1, 1, 1, 1).map(_.toByte)
+    val aggStats1 = FeatureVector.initAggStats(values, labels1, featureArity, metadata)
+    testHelper(labels1, aggStats1, Array(0.0), Array(2.0, 0.0), Array(0.0, 5.0))
+
+    val labels2 = Array(0, 0, 0, 1, 1, 1, 1).map(_.toByte)
+    val aggStats2 = FeatureVector.initAggStats(values, labels2, featureArity, metadata)
+    testHelper(labels2, aggStats2, Array(0.0, 1.0), Array(3.0, 0.0), Array(0.0, 4.0))
+  }
+
+  test("chooseOrderedCategoricalSplit: return bad split if we should not split") {
+    val featureIndex = 0
+    val values = Array(0, 0, 1, 2, 2, 2, 2).map(_.toDouble)
+    val featureArity = values.max.toInt + 1
+
+    val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+    val impurity = Entropy
+    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
+      Map(featureIndex -> featureArity))
+    val fullImpurityAgg = metadata.createImpurityAggregator()
+    val aggStats = FeatureVector.initAggStats(values, labels, featureArity, metadata)
+    aggStats.foreach(agg => fullImpurityAgg.add(agg))
+    val (split, stats) =
+      AltDTRegression.chooseOrderedCategoricalSplit(featureIndex, aggStats, fullImpurityAgg,
+        metadata, featureArity)
+    assert(split.isEmpty)
+    val fullImpurityStatsArray =
+      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
+    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
+    assert(stats.gain === 0.0)
+    assert(stats.impurity === fullImpurity)
+    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+    assert(stats.valid)
+  }
+
+  test("chooseUnorderedCategoricalSplit: basic case") {
+    val featureIndex = 0
+    val featureArity = 4
+    val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
+    val labels = Array(0.0, 0.0, 1.0, 1.0, 2.0)
+    val impurity = Entropy
+    val metadata = new AltDTMetadata(numClasses = 3, maxBins = 16, minInfoGain = 0.0, impurity,
+      Map(featureIndex -> featureArity))
+    val fullImpurityAgg = metadata.createImpurityAggregator()
+    val aggStats = FeatureVector.initAggStats(values, labels, featureArity, metadata)
+    aggStats.foreach(agg => fullImpurityAgg.add(agg))
+    val allSplits = metadata.getUnorderedSplits(featureIndex)
+    val (split, _) = AltDTRegression.chooseUnorderedCategoricalSplit(featureIndex, aggStats, fullImpurityAgg,
+      metadata, featureArity, allSplits)
+    split match {
+      case Some(s: CategoricalSplit) =>
+        assert(s.featureIndex === featureIndex)
+        assert(s.leftCategories.toSet === Set(0.0, 2.0))
+        assert(s.rightCategories.toSet === Set(1.0, 3.0))
+        // TODO: test correctness of stats
+      case _ =>
+        throw new AssertionError(
+          s"Expected CategoricalSplit but got ${split.getClass.getSimpleName}")
+    }
+  }
+
+  test("chooseUnorderedCategoricalSplit: return bad split if we should not split") {
+    val featureIndex = 0
+    val featureArity = 4
+    val values = Array(3.0, 1.0, 0.0, 2.0, 2.0)
+    val labels = Array(1.0, 1.0, 1.0, 1.0, 1.0).map(_.toByte)
+    val impurity = Entropy
+    val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, impurity,
+      Map(featureIndex -> featureArity))
+    val fullImpurityAgg = metadata.createImpurityAggregator()
+    val aggStats = FeatureVector.initAggStats(values, labels, featureArity, metadata)
+    aggStats.foreach(agg => fullImpurityAgg.add(agg))
+    val (split, stats) =
+      AltDTClassification.chooseOrderedCategoricalSplit(featureIndex, aggStats, fullImpurityAgg, metadata, featureArity)
+    assert(split.isEmpty)
+    val fullImpurityStatsArray =
+      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
+    val fullImpurity = impurity.calculate(fullImpurityStatsArray, labels.length)
+    assert(stats.gain === 0.0)
+    assert(stats.impurity === fullImpurity)
+    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+    assert(stats.valid)
+  }
 
   test("chooseContinuousSplit: basic case") {
     val featureIndex = 0
@@ -466,7 +498,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
 
   test("bitSubvectorFromSplit: 1 node") {
     val col =
-      FeatureVector.fromOriginal(0, 0, Array(0.1, 0.2, 0.4, 0.6, 0.7), null)
+      FeatureVector.fromOriginal(0, 0, Array(0.1, 0.2, 0.4, 0.6, 0.7))
     val split = new ContinuousSplit(0, threshold = 0.5)
     val bitv = AltDT.bitVectorFromSplit(col, 0, split)
     assert(bitv.toArray.toSet === Set(3, 4))
@@ -475,7 +507,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
   test("bitSubvectorFromSplit: 2 nodes") {
     // Initially, 1 split: (0, 2, 4) | (1, 3)
     val col = new FeatureVector(0, 0, Array(0.1, 0.2, 0.4, 0.6, 0.7), Array(4, 2, 0, 1, 3),
-      null, Array(0, 0, 0, 1, 1))
+      Array(0, 0, 0, 1, 1))
 
     def checkSplit(nodeIndex: Int, threshold: Double,
       expectedRight: Set[Int]): Unit = {
@@ -500,9 +532,9 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map(1 -> 3))
     val fullImpurityAgg = metadata.createImpurityAggregator()
     labels.foreach(label => fullImpurityAgg.update(label))
-    val col = FeatureVector.fromOriginal(0, 0, Array(0.1, 0.2, 0.4, 0.6, 0.7), fullImpurityAgg)
+    val col = FeatureVector.fromOriginal(0, 0, Array(0.1, 0.2, 0.4, 0.6, 0.7))
 
-    val info = PartitionInfo(Array(col))
+    val info = PartitionInfo(Array(col), Array(fullImpurityAgg))
     val partitionInfos = sc.parallelize(Seq(info))
     val bestSplit = new ContinuousSplit(0, threshold = 0.5)
     val bitVector = AltDT.aggregateBitVector(partitionInfos, Array(Some(bestSplit)))
@@ -516,10 +548,9 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     labels.foreach(label => fullImpurityAgg.update(label))
     val col = new FeatureVector(0, 0,
       Array(-4.0, -4.0, -2.0, -2.0, -1.0, -1.0, 1.0, 1.0),
-      Array(3, 7, 2, 6, 1, 5, 0, 4), Array(fullImpurityAgg),
-    new Array[Int](8))
+      Array(3, 7, 2, 6, 1, 5, 0, 4), new Array[Int](8))
 
-    val info = PartitionInfo(Array(col))
+    val info = PartitionInfo(Array(col), Array(fullImpurityAgg))
     val partitionInfos = sc.parallelize(Seq(info))
     val bestSplit = new ContinuousSplit(0, threshold = -2.0)
     val bitVector = AltDT.aggregateBitVector(partitionInfos, Array(Some(bestSplit)))

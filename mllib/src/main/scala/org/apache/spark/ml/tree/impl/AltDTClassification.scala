@@ -27,18 +27,16 @@ object AltDTClassification {
     //       rather than 1 copy per worker. This means a lot of random accesses.
     //       We could improve this by applying first-level sorting (by node) to labels.
 
-    // Initialize partitions with 1 node (each instance at the root node).
-    val fullImpurityAgg = metadata.createImpurityAggregator()
-    var i = 0
-    while (i < labels.length) {
-      fullImpurityAgg.update(labels(i))
-      i += 1
-    }
-
     // Sort each column by feature values.
     val colStore: RDD[FeatureVector] = colStoreInit.map { case (featureIndex, col) =>
       val featureArity: Int = metadata.categoricalFeaturesInfo.getOrElse(featureIndex, 0)
-      FeatureVector.fromOriginal(featureIndex, featureArity, col, fullImpurityAgg)
+      if (featureArity > 0) {
+        // aggStats(category) = label statistics for category
+        val aggStats = FeatureVector.initAggStats(col, labelsBc.value, featureArity, metadata)
+        FeatureVector.fromOriginal(featureIndex, featureArity, col, Array(aggStats))
+      } else {
+        FeatureVector.fromOriginal(featureIndex, featureArity, col)
+      }
     }
     // Group columns together into one array of columns per partition.
     // TODO: Test avoiding this grouping, and see if it matters.
@@ -48,7 +46,15 @@ object AltDTClassification {
     }
     groupedColStore.persist(StorageLevel.MEMORY_AND_DISK)
 
-    var partitionInfos: RDD[PartitionInfo] = groupedColStore.map(new PartitionInfo(_))
+    // Initialize partitions with 1 node (each instance at the root node).
+    val fullImpurityAgg = metadata.createImpurityAggregator()
+    var i = 0
+    while (i < labels.length) {
+      fullImpurityAgg.update(labels(i))
+      i += 1
+    }
+
+    var partitionInfos: RDD[PartitionInfo] = groupedColStore.map(new PartitionInfo(_, Array(fullImpurityAgg)))
 
     // Initialize model.
     // Note: We do not use node indices.
@@ -124,11 +130,11 @@ object AltDTClassification {
     //   for each active node, best split + info gain,
     //     where the best split is None if no useful split exists
     val partBestSplitsAndGains: RDD[Array[(Option[Split], ImpurityStats)]] = partitionInfos.map {
-      case PartitionInfo(columns: Array[FeatureVector]) =>
+      case PartitionInfo(columns: Array[FeatureVector], fullImpurityAggs: Array[ImpurityAggregatorSingle]) =>
         val localLabels = labelsBc.value
-        val toReturn = chooseSplitsForActiveNodes(columns(0), numActiveNodes, localLabels, metadata)
+        val toReturn = chooseSplitsForActiveNodes(columns(0), numActiveNodes, localLabels, fullImpurityAggs, metadata)
         columns.drop(1).foreach { col =>
-          val splitsForCol = chooseSplitsForActiveNodes(col, numActiveNodes, localLabels, metadata)
+          val splitsForCol = chooseSplitsForActiveNodes(col, numActiveNodes, localLabels, fullImpurityAggs, metadata)
           splitsForCol.zipWithIndex.foreach { case (splitAndStats, idx) =>
             if (splitAndStats._2.gain > toReturn(idx)._2.gain) {
               toReturn(idx) = splitAndStats
@@ -162,26 +168,30 @@ object AltDTClassification {
                                                 col: FeatureVector,
                                                 numActiveNodes: Int,
                                                 labels: Array[Byte],
+                                                fullImpurityAggs: Array[ImpurityAggregatorSingle],
                                                 metadata: AltDTMetadata): Array[(Option[Split], ImpurityStats)] = {
-    assert(col.fullImpurityAggs.length == numActiveNodes)
-//    if (col.isCategorical) {
-//      if (metadata.isUnorderedFeature(col.featureIndex)) {
-//        val splits: Array[CategoricalSplit] = metadata.getUnorderedSplits(col.featureIndex)
-//        chooseUnorderedCategoricalSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
-//          metadata, col.featureArity, splits)
-//      } else {
-//        chooseOrderedCategoricalSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
-//          metadata, col.featureArity)
-//      }
-//    } else {
-    if (col.sparse) {
-      chooseContinuousSplitsSparseForActiveNodes(col.featureIndex, numActiveNodes, col.compressedVals,
-        col.indices, labels, col.nodeIndices, col.fullImpurityAggs, metadata)
+    if (col.isCategorical) {
+      if (metadata.isUnorderedFeature(col.featureIndex)) {
+        val splits: Array[CategoricalSplit] = metadata.getUnorderedSplits(col.featureIndex)
+        Range(0, numActiveNodes).toArray.map { nodeIndex =>
+          chooseUnorderedCategoricalSplit(col.featureIndex, col.aggStats(nodeIndex), fullImpurityAggs(nodeIndex),
+            metadata, col.featureArity, splits)
+        }
+      } else {
+        Range(0, numActiveNodes).toArray.map { nodeIndex =>
+          chooseOrderedCategoricalSplit(col.featureIndex, col.aggStats(nodeIndex), fullImpurityAggs(nodeIndex),
+            metadata, col.featureArity)
+        }
+      }
     } else {
-      chooseContinuousSplitsForActiveNodes(col.featureIndex, numActiveNodes, col.values, col.indices, labels,
-        col.nodeIndices, col.fullImpurityAggs, metadata)
+      if (col.sparse) {
+        chooseContinuousSplitsSparseForActiveNodes(col.featureIndex, numActiveNodes, col.compressedVals,
+          col.indices, labels, col.nodeIndices, fullImpurityAggs, metadata)
+      } else {
+        chooseContinuousSplitsForActiveNodes(col.featureIndex, numActiveNodes, col.values, col.indices, labels,
+          col.nodeIndices, fullImpurityAggs, metadata)
+      }
     }
-//    }
   }
 
   /**
@@ -195,33 +205,18 @@ object AltDTClassification {
    * Thus, with K categories, we consider K - 1 possible splits.
    *
    * @param featureIndex  Index of feature being split.
-   * @param values  Feature values at this node.  Sorted in increasing order.
-   * @param labels  Labels corresponding to values, in the same order.
    * @return  (best split, statistics for split)  If the best split actually puts all instances
    *          in one leaf node, then it will be set to None.  The impurity stats maybe still be
    *          useful, so they are returned.
    */
+  // TODO: Support high-arity features by using a single array to hold the stats.
   private[impl] def chooseOrderedCategoricalSplit(
                                                    featureIndex: Int,
-                                                   values: Array[Double],
-                                                   indices: Array[Int],
-                                                   labels: Array[Byte],
-                                                   from: Int,
-                                                   to: Int,
+                                                   // aggStats(category) = label statistics for category
+                                                   aggStats: Array[ImpurityAggregatorSingle],
+                                                   fullImpurityAgg: ImpurityAggregatorSingle,
                                                    metadata: AltDTMetadata,
                                                    featureArity: Int): (Option[Split], ImpurityStats) = {
-    // TODO: Support high-arity features by using a single array to hold the stats.
-
-    // aggStats(category) = label statistics for category
-    val aggStats = Array.tabulate[ImpurityAggregatorSingle](featureArity)(
-      _ => metadata.createImpurityAggregator())
-    var i = from
-    while (i < to) {
-      val cat = values(i)
-      val label = labels(indices(i))
-      aggStats(cat.toInt).update(label)
-      i += 1
-    }
 
     // Compute centroids.  centroidsForCategories is a list: (category, centroid)
     val centroidsForCategories = if (metadata.isMulticlass) {
@@ -333,39 +328,21 @@ object AltDTClassification {
    * - Considers all possible subsets (exponentially many)
    *
    * @param featureIndex  Index of feature being split.
-   * @param values  Feature values at this node.  Sorted in increasing order.
-   * @param labels  Labels corresponding to values, in the same order.
    * @return  (best split, statistics for split)  If the best split actually puts all instances
    *          in one leaf node, then it will be set to None.  The impurity stats maybe still be
    *          useful, so they are returned.
    */
   private[impl] def chooseUnorderedCategoricalSplit(
                                                      featureIndex: Int,
-                                                     values: Array[Double],
-                                                     indices: Array[Int],
-                                                     labels: Array[Byte],
-                                                     from: Int,
-                                                     to: Int,
+                                                     // aggStats(category) = label statistics for category
+                                                     aggStats: Array[ImpurityAggregatorSingle],
+                                                     fullImpurityAgg: ImpurityAggregatorSingle,
                                                      metadata: AltDTMetadata,
                                                      featureArity: Int,
                                                      splits: Array[CategoricalSplit]): (Option[Split], ImpurityStats) = {
 
-    // Label stats for each category
-    val aggStats = Array.tabulate[ImpurityAggregatorSingle](featureArity)(
-      _ => metadata.createImpurityAggregator())
-    var i = from
-    while (i < to) {
-      val cat = values(i)
-      val label = labels(indices(i))
-      // NOTE: we assume the values for categorical features are Ints in [0,featureArity)
-      aggStats(cat.toInt).update(label)
-      i += 1
-    }
-
     // Aggregated statistics for left part of split and entire split.
     val leftImpurityAgg = metadata.createImpurityAggregator()
-    val fullImpurityAgg = metadata.createImpurityAggregator()
-    aggStats.foreach(fullImpurityAgg.add)
     val fullImpurity = fullImpurityAgg.getCalculator.calculate()
 
     if (featureArity == 1) {
@@ -383,7 +360,7 @@ object AltDTClassification {
       var bestSplit: Option[CategoricalSplit] = None
       val bestLeftImpurityAgg = leftImpurityAgg.deepCopy()
       var bestGain: Double = -1.0
-      val fullCount: Double = to - from
+      val fullCount: Double = fullImpurityAgg.getCount
       for (split <- splits) {
         // Update left, right impurity stats
         split.leftCategories.foreach(c => leftImpurityAgg.add(aggStats(c.toInt)))
