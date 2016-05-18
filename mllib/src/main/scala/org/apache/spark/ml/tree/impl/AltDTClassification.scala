@@ -8,7 +8,6 @@ import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.collection.BitSet
-import org.roaringbitmap.RoaringBitmap
 
 object AltDTClassification {
 
@@ -51,7 +50,6 @@ object AltDTClassification {
     var partitionInfos: RDD[PartitionInfo] = groupedColStore.map { groupedCols =>
       val initActive = new BitSet(1)
       initActive.set(0)
-
       new PartitionInfo(groupedCols, Array[Int](0, numRows), initActive, Array(fullImpurityAgg))
     }
 
@@ -69,47 +67,38 @@ object AltDTClassification {
       // Compute best split for each active node.
       val bestSplitsAndGains: Array[(Option[Split], ImpurityStats)] =
         computeBestSplits(partitionInfos, labelsBc, metadata)
-      /*
-      // NOTE: The actual active nodes (activeNodePeriphery) may be a subset of the nodes under
-      //       bestSplitsAndGains since
-      assert(activeNodePeriphery.length == bestSplitsAndGains.length,
-        s"activeNodePeriphery.length=${activeNodePeriphery.length} does not equal" +
-          s" bestSplitsAndGains.length=${bestSplitsAndGains.length}")
-      */
 
       // Update current model and node periphery.
       // Note: This flatMap has side effects (on the model).
       activeNodePeriphery =
         AltDT.computeActiveNodePeriphery(activeNodePeriphery, bestSplitsAndGains, metadata.minInfoGain)
+      val activeNodeMap = AltDT.computeActiveNodeMap(bestSplitsAndGains, metadata.minInfoGain)
       // We keep all old nodeOffsets and add one for each node split.
       // Each node split adds 2 nodes to activeNodePeriphery.
-      // TODO: Should this be calculated after filtering for impurity??
       numNodeOffsets = numNodeOffsets + activeNodePeriphery.length / 2
 
       // Filter active node periphery by impurity.
       val estimatedRemainingActive = activeNodePeriphery.count(_.stats.impurity > 0.0)
 
-      // TODO: Check to make sure we split something, and stop otherwise.
       doneLearning = currentLevel + 1 >= maxDepth || estimatedRemainingActive == 0
 
       if (!doneLearning) {
         val splits: Array[Option[Split]] = bestSplitsAndGains.map(_._1)
 
         // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right
-        val aggBitVector: RoaringBitmap = AltDT.aggregateBitVector(partitionInfos, splits, numRows)
+        val aggBitVector = AltDT.aggregateBitVector(partitionInfos, splits, numRows)
+
         val newPartitionInfos = partitionInfos.map { partitionInfo =>
           val bv = new BitSet(numRows)
           val iter = aggBitVector.getIntIterator
-          while(iter.hasNext) {
+          while (iter.hasNext) {
             bv.set(iter.next)
           }
-          partitionInfo.update(bv, numNodeOffsets, labelsBc.value, metadata)
+          partitionInfo.update(bv, activeNodeMap, numNodeOffsets, labelsBc.value, metadata)
         }
-        // TODO: remove.  For some reason, this is needed to make things work.
-        // Probably messing up somewhere above...
+
         newPartitionInfos.cache().count()
         partitionInfos = newPartitionInfos
-
       }
       currentLevel += 1
     }
@@ -144,21 +133,14 @@ object AltDTClassification {
       case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
       activeNodes: BitSet, fullImpurityAggs: Array[ImpurityAggregatorSingle]) =>
         val localLabels = labelsBc.value
-        // Iterate over the active nodes in the current level.
-        val toReturn = new Array[(Option[Split], ImpurityStats)](activeNodes.cardinality())
-        val iter: Iterator[Int] = activeNodes.iterator
-        var i = 0
-        while (iter.hasNext) {
-          val nodeIndexInLevel = iter.next
-          val fromOffset = nodeOffsets(nodeIndexInLevel)
-          val toOffset = nodeOffsets(nodeIndexInLevel + 1)
-          val fullImpurityAgg = fullImpurityAggs(nodeIndexInLevel)
-          val splitsAndStats =
-            columns.map { col =>
-              chooseSplit(col, localLabels, fromOffset, toOffset, fullImpurityAgg, metadata)
+        val toReturn = chooseSplitsForActiveNodes(columns(0), activeNodes, nodeOffsets, fullImpurityAggs, localLabels, metadata).toArray
+        columns.drop(1).foreach { col =>
+          val splitsForCol = chooseSplitsForActiveNodes(col, activeNodes, nodeOffsets, fullImpurityAggs, localLabels, metadata)
+          splitsForCol.zipWithIndex.foreach { case (splitAndStats, idx) =>
+            if (splitAndStats._2.gain > toReturn(idx)._2.gain) {
+              toReturn(idx) = splitAndStats
             }
-          toReturn(i) = splitsAndStats.maxBy(_._2.gain)
-          i += 1
+          }
         }
         toReturn
     }
@@ -183,25 +165,57 @@ object AltDTClassification {
    * @return  (best split, statistics for split)  If the best split actually puts all instances
    *          in one leaf node, then it will be set to None.
    */
-  private[impl] def chooseSplit(
-                                 col: FeatureVector,
-                                 labels: Array[Byte],
-                                 fromOffset: Int,
-                                 toOffset: Int,
-                                 fullImpurityAgg: ImpurityAggregatorSingle,
-                                 metadata: AltDTMetadata): (Option[Split], ImpurityStats) = {
+  private[impl] def chooseSplitsForActiveNodes(
+                                                col: FeatureVector,
+                                                activeNodes: BitSet,
+                                                nodeOffsets: Array[Int],
+                                                fullImpurityAggs: Array[ImpurityAggregatorSingle],
+                                                labels: Array[Byte],
+                                                metadata: AltDTMetadata): Array[(Option[Split], ImpurityStats)] = {
     if (col.isCategorical) {
       if (metadata.isUnorderedFeature(col.featureIndex)) {
-        val splits: Array[CategoricalSplit] = metadata.getUnorderedSplits(col.featureIndex)
-        chooseUnorderedCategoricalSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
-          metadata, col.featureArity, splits)
+        val splits = metadata.getUnorderedSplits(col.featureIndex)
+        val toReturn = new Array[(Option[Split], ImpurityStats)](activeNodes.cardinality())
+        var i = 0
+        activeNodes.iterator.foreach { nodeIndexInLevel =>
+          val fromOffset = nodeOffsets(nodeIndexInLevel)
+          val toOffset = nodeOffsets(nodeIndexInLevel + 1)
+          val fullImpurityAgg = fullImpurityAggs(i)
+          toReturn(i) = chooseUnorderedCategoricalSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
+            fullImpurityAgg, metadata, col.featureArity, splits)
+          i += 1
+        }
+        toReturn
       } else {
-        chooseOrderedCategoricalSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
-          metadata, col.featureArity)
+        val toReturn = new Array[(Option[Split], ImpurityStats)](activeNodes.cardinality())
+        var i = 0
+        activeNodes.iterator.foreach { nodeIndexInLevel =>
+          val fromOffset = nodeOffsets(nodeIndexInLevel)
+          val toOffset = nodeOffsets(nodeIndexInLevel + 1)
+          val fullImpurityAgg = fullImpurityAggs(i)
+          toReturn(i) = chooseOrderedCategoricalSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
+            fullImpurityAgg, metadata, col.featureArity)
+          i += 1
+        }
+        toReturn
       }
     } else {
-      chooseContinuousSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
-        fullImpurityAgg, metadata)
+      if (col.sparse) {
+        chooseContinuousSplitsSparseForActiveNodes(col.featureIndex, col.compressedVals, col.indices, labels,
+        col.nodeIndices, fullImpurityAggs, metadata)
+      } else {
+        val toReturn = new Array[(Option[Split], ImpurityStats)](activeNodes.cardinality())
+        var i = 0
+        activeNodes.iterator.foreach { nodeIndexInLevel =>
+          val fromOffset = nodeOffsets(nodeIndexInLevel)
+          val toOffset = nodeOffsets(nodeIndexInLevel + 1)
+          val fullImpurityAgg = fullImpurityAggs(i)
+          toReturn(i) = chooseContinuousSplit(col.featureIndex, col.values, col.indices, labels, fromOffset, toOffset,
+            fullImpurityAgg, metadata)
+          i += 1
+        }
+        toReturn
+      }
     }
   }
 
@@ -229,6 +243,7 @@ object AltDTClassification {
                                                    labels: Array[Byte],
                                                    from: Int,
                                                    to: Int,
+                                                   fullImpurityAgg: ImpurityAggregatorSingle,
                                                    metadata: AltDTMetadata,
                                                    featureArity: Int): (Option[Split], ImpurityStats) = {
     // TODO: Support high-arity features by using a single array to hold the stats.
@@ -288,13 +303,7 @@ object AltDTClassification {
 
     // Cumulative sums of bin statistics for left, right parts of split.
     val leftImpurityAgg = metadata.createImpurityAggregator()
-    val rightImpurityAgg = metadata.createImpurityAggregator()
-    var j = 0
-    val length = aggStats.length
-    while (j < length) {
-      rightImpurityAgg.add(aggStats(j))
-      j += 1
-    }
+    val rightImpurityAgg = fullImpurityAgg.deepCopy()
 
     var bestSplitIndex: Int = -1  // index into categoriesSortedByCentroid
     val bestLeftImpurityAgg = leftImpurityAgg.deepCopy()
@@ -333,7 +342,6 @@ object AltDTClassification {
       categoriesSortedByCentroid.slice(0, bestSplitIndex + 1).map(_.toDouble)
     val bestFeatureSplit =
       new CategoricalSplit(featureIndex, categoriesForSplit.toArray, featureArity)
-    val fullImpurityAgg = leftImpurityAgg.deepCopy().add(rightImpurityAgg)
     val bestRightImpurityAgg = fullImpurityAgg.deepCopy().subtract(bestLeftImpurityAgg)
     val bestImpurityStats = new ImpurityStats(bestGain, fullImpurity, fullImpurityAgg.getCalculator,
       bestLeftImpurityAgg.getCalculator, bestRightImpurityAgg.getCalculator)
@@ -365,6 +373,7 @@ object AltDTClassification {
                                                      labels: Array[Byte],
                                                      from: Int,
                                                      to: Int,
+                                                     fullImpurityAgg: ImpurityAggregatorSingle,
                                                      metadata: AltDTMetadata,
                                                      featureArity: Int,
                                                      splits: Array[CategoricalSplit]): (Option[Split], ImpurityStats) = {
@@ -383,8 +392,6 @@ object AltDTClassification {
 
     // Aggregated statistics for left part of split and entire split.
     val leftImpurityAgg = metadata.createImpurityAggregator()
-    val fullImpurityAgg = metadata.createImpurityAggregator()
-    aggStats.foreach(fullImpurityAgg.add)
     val fullImpurity = fullImpurityAgg.getCalculator.calculate()
 
     if (featureArity == 1) {
@@ -500,5 +507,101 @@ object AltDTClassification {
       None
     }
     (split, bestImpurityStats)
+  }
+
+  /**
+   * Choose splitting rule: feature value <= threshold for all active nodes in periphery on a sparse
+   * (i.e. compressed) column
+   * @return  Array[(best split, statistics for split)]
+   */
+  def chooseContinuousSplitsSparseForActiveNodes(
+                                                  featureIndex: Int,
+                                                  compressedVals: Array[(Double, Int)],
+                                                  indices: Array[Int],
+                                                  labels: Array[Byte],
+                                                  nodeIndices: Array[Int],
+                                                  fullImpurityAggs: Array[ImpurityAggregatorSingle],
+                                                  metadata: AltDTMetadata): Array[(Option[Split], ImpurityStats)] = {
+
+    val numActiveNodes = fullImpurityAggs.length
+
+    val leftImpurityAggs = Array.fill[ImpurityAggregatorSingle](numActiveNodes)(metadata.createImpurityAggregator())
+    val bestLeftImpurityAggs = Array.fill[ImpurityAggregatorSingle](numActiveNodes)(metadata.createImpurityAggregator())
+    val rightImpurityAggs = fullImpurityAggs.map(agg => agg.deepCopy())
+    val fullImpurities = fullImpurityAggs.map(agg => agg.getCalculator.calculate())
+
+    val bestThresholds = Array.fill[Double](numActiveNodes)(Double.NegativeInfinity)
+    val currentThresholds = Array.fill[Double](numActiveNodes)(Double.NegativeInfinity)
+    val bestGains = new Array[Double](numActiveNodes)
+    val leftCounts = new Array[Int](numActiveNodes)
+    val fullCounts = fullImpurityAggs.map(agg => agg.getCount)
+    val rightCounts = fullImpurityAggs.map(agg => agg.getCount.toInt)
+
+    var i = 0
+    var valIndex = 0
+    var valCountIndex = 0
+    var currVal = Double.NegativeInfinity
+    var currCount = 0
+    while (i < labels.length) {
+      if (valCountIndex == currCount) {
+        val valAndCount = compressedVals(valIndex)
+        currVal = valAndCount._1
+        currCount = valAndCount._2
+        valCountIndex = 0
+        valIndex += 1
+      }
+
+      val nodeIdx = nodeIndices(i)
+      if (nodeIdx >= 0) {
+        val label = labels(indices(i))
+        val leftImpurityAgg = leftImpurityAggs(nodeIdx)
+        val rightImpurityAgg = rightImpurityAggs(nodeIdx)
+
+        val currentThreshold = currentThresholds(nodeIdx)
+        if (currVal != currentThreshold) {
+          val leftCount = leftCounts(nodeIdx)
+          val rightCount = rightCounts(nodeIdx)
+          val fullCount = fullCounts(nodeIdx)
+          val fullImpurity = fullImpurities(nodeIdx)
+          val bestGain = bestGains(nodeIdx)
+          // Check gain
+          val leftWeight = leftCount / fullCount
+          val rightWeight = rightCount / fullCount
+          val leftImpurity = leftImpurityAgg.getCalculator.calculate()
+          val rightImpurity = rightImpurityAgg.getCalculator.calculate()
+          val gain = fullImpurity - leftWeight * leftImpurity - rightWeight * rightImpurity
+          if (leftCount != 0 && rightCount != 0 && gain > bestGain && gain > metadata.minInfoGain) {
+            bestThresholds(nodeIdx) = currentThreshold
+            val bestLeftImpurityAgg = bestLeftImpurityAggs(nodeIdx)
+            System.arraycopy(leftImpurityAgg.stats, 0, bestLeftImpurityAgg.stats, 0, leftImpurityAgg.stats.length)
+            bestGains(nodeIdx) = gain
+          }
+          currentThresholds(nodeIdx) = currVal
+        }
+        // Move this instance from right to left side of split.
+        leftImpurityAgg.update(label, 1)
+        rightImpurityAgg.update(label, -1)
+        leftCounts(nodeIdx) += 1
+        rightCounts(nodeIdx) -= 1
+      }
+      valCountIndex += 1
+      i += 1
+    }
+
+    val splitsAndStats = Range(0, numActiveNodes).toArray.map { nodeIdx =>
+      val bestThreshold = bestThresholds(nodeIdx)
+      val bestRightImpurityAgg = fullImpurityAggs(nodeIdx).deepCopy().subtract(bestLeftImpurityAggs(nodeIdx))
+      val split: Option[Split] = {
+        if (bestThreshold != Double.NegativeInfinity && bestThreshold != currentThresholds(nodeIdx)) {
+          Some(new ContinuousSplit(featureIndex, bestThreshold))
+        } else {
+          None
+        }
+      }
+      (split, new ImpurityStats(bestGains(nodeIdx), fullImpurities(nodeIdx),
+        fullImpurityAggs(nodeIdx).getCalculator, bestLeftImpurityAggs(nodeIdx).getCalculator,
+        bestRightImpurityAgg.getCalculator))
+    }
+    splitsAndStats
   }
 }

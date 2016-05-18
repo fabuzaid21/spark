@@ -17,8 +17,9 @@
 
 package org.apache.spark.ml.tree.impl
 
+import java.util.{HashMap => JavaHashMap}
+
 import org.apache.spark.Logging
-import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.tree._
 import org.apache.spark.ml.tree.impl.TreeUtil._
 import org.apache.spark.mllib.regression.LabeledPoint
@@ -29,6 +30,8 @@ import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
 import org.apache.spark.util.collection.{BitSet, SortDataFormat, Sorter}
 import org.roaringbitmap.RoaringBitmap
+
+import scala.collection.mutable.ArrayBuffer
 
 
 /**
@@ -222,42 +225,47 @@ private[ml] object AltDT extends Logging {
    * @return Array of bit vectors, ordered by offset ranges
    */
   private[impl] def aggregateBitVector(
-      partitionInfos: RDD[PartitionInfo],
-      bestSplits: Array[Option[Split]],
-      numRows: Int): RoaringBitmap = {
-    val bestSplitsBc: Broadcast[Array[Option[Split]]] =
-      partitionInfos.sparkContext.broadcast(bestSplits)
-    val workerBitSubvectors: RDD[RoaringBitmap] = partitionInfos.map {
+                                        partitionInfos: RDD[PartitionInfo],
+                                        bestSplits: Array[Option[Split]],
+                                        numRows: Int) = {
+    val bestSplitsBc = partitionInfos.sparkContext.broadcast(bestSplits)
+    val workerBitSubvectors = partitionInfos.map {
       case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
                          activeNodes: BitSet, fullImpurities: Array[ImpurityAggregatorSingle]) =>
         val localBestSplits: Array[Option[Split]] = bestSplitsBc.value
         // localFeatureIndex[feature index] = index into PartitionInfo.columns
         val localFeatureIndex: Map[Int, Int] = columns.map(_.featureIndex).zipWithIndex.toMap
-        val bitSetForNodes: Iterator[RoaringBitmap] = activeNodes.iterator
-          .zip(localBestSplits.iterator).flatMap {
-          case (nodeIndexInLevel: Int, Some(split: Split)) =>
+        val bitVectorForNodes = activeNodes.iterator.zip(localBestSplits.iterator).flatMap {
+          case (nodeIndexInLevel, Some(split)) =>
+            println(s"split aggregate bit vector, feature index: ${split.featureIndex}")
             if (localFeatureIndex.contains(split.featureIndex)) {
               // This partition has the column (feature) used for this split.
-              val fromOffset = nodeOffsets(nodeIndexInLevel)
-              val toOffset = nodeOffsets(nodeIndexInLevel + 1)
-              val colIndex: Int = localFeatureIndex(split.featureIndex)
-              Iterator(bitVectorFromSplit(columns(colIndex), fromOffset, toOffset, split, numRows))
+              val col = columns(localFeatureIndex(split.featureIndex))
+              val bv = {
+                if (col.sparse) {
+                  bitVectorFromSplitSparse(col, nodeIndexInLevel, split)
+                } else {
+                  val fromOffset = nodeOffsets(nodeIndexInLevel)
+                  val toOffset = nodeOffsets(nodeIndexInLevel + 1)
+                  bitVectorFromSplit(col, fromOffset, toOffset, split, numRows)
+                }
+              }
+              Iterator(bv)
             } else {
               Iterator()
             }
-          case (nodeIndexInLevel: Int, None) =>
+          case (_, None) =>
             // Do not create a bitVector when there is no split.
             // PartitionInfo.update will detect that there is no
             // split, by how many instances go left/right.
             Iterator()
         }
-        if (bitSetForNodes.isEmpty) {
-          new RoaringBitmap()
-        } else {
-          bitSetForNodes.reduce[RoaringBitmap] { (acc, bitv) => acc.or(bitv); acc }
+        bitVectorForNodes.fold(new RoaringBitmap()) { (acc, bitv) =>
+          acc.or(bitv)
+          acc
         }
     }
-    val aggBitVector: RoaringBitmap = workerBitSubvectors.reduce { (acc, bitv) =>
+    val aggBitVector: RoaringBitmap = workerBitSubvectors.treeReduce { (acc, bitv) =>
       acc.or(bitv)
       acc
     }
@@ -300,6 +308,62 @@ private[ml] object AltDT extends Logging {
   }
 
   /**
+   * Same as above, but for sparse columns (columns that have been compressed via run-length encoding)
+   */
+  private[impl] def bitVectorFromSplitSparse(
+                                              col: FeatureVector,
+                                              nodeIndex: Int,
+                                              split: Split): RoaringBitmap = {
+    println(s"nodeIndex in bitvectorFromSplitSparse: $nodeIndex")
+    println(s"col featureIndex: ${col.featureIndex}, nodeIndices: ${col.nodeIndices.mkString(", ")}")
+    val bitv = new RoaringBitmap()
+    var i = 0
+    var valIndex = 0
+    var valCountIndex = 0
+    var currVal = Double.NegativeInfinity
+    var currCount = 0
+    while (i < col.nodeIndices.length) {
+      if (valCountIndex == currCount) {
+        val valAndCount = col.compressedVals(valIndex)
+        currVal = valAndCount._1
+        currCount = valAndCount._2
+        valCountIndex = 0
+        valIndex += 1
+      }
+      if (col.nodeIndices(i) == nodeIndex) {
+        val idx = col.indices(i)
+        if (!split.shouldGoLeft(currVal)) {
+          bitv.add(idx)
+        }
+      }
+      valCountIndex += 1
+      i += 1
+    }
+    bitv
+  }
+
+  /**
+   * Compute mapping from node index to active node index
+   */
+  private[impl] def computeActiveNodeMap(
+                                          activeNodes: BitSet,
+                                          bestSplitsAndGains: Array[(Option[Split], ImpurityStats)],
+                                          minInfoGain: Double): JavaHashMap[Int, Int] = {
+    val activeNodeMap = new JavaHashMap[Int, Int]()
+    var newNodeIdx = 0
+    bestSplitsAndGains.zipWithIndex.foreach { case ((split, stats), nodeIdx) =>
+      if (split.nonEmpty && stats.gain > minInfoGain) {
+        activeNodeMap.put(nodeIdx << 1, newNodeIdx)
+        activeNodeMap.put((nodeIdx << 1) + 1, newNodeIdx + 1)
+        newNodeIdx += 2
+      } else {
+        newNodeIdx += 1
+      }
+    }
+    activeNodeMap
+  }
+
+  /**
    * Intermediate data stored on each partition during learning.
    *
    * Node indexing for nodeOffsets, activeNodes:
@@ -326,9 +390,18 @@ private[ml] object AltDT extends Logging {
       fullImpurityAggs: Array[ImpurityAggregatorSingle]) extends Serializable {
 
     // pre-allocated temporary buffers that we use to sort
-    // instances in left and right children during update
-    val tempVals: Array[Double] = new Array[Double](columns(0).values.length)
-    val tempIndices: Array[Int] = new Array[Int](columns(0).values.length)
+    // instances in left and right children during update.
+    // If all columns are sparse, then don't allocate them,
+    // since we won't be needing them for sorting.
+    val (tempVals, tempIndices) = {
+      val colIdx = columns.indexWhere(!_.sparse)
+      if (colIdx >= 0) {
+        (new Array[Double](columns(0).values.length),
+          new Array[Int](columns(0).values.length))
+      } else {
+        (null, null)
+      }
+    }
 
     /** For debugging */
     override def toString: String = {
@@ -358,20 +431,23 @@ private[ml] object AltDT extends Logging {
      *                    For instances at inactive (leaf) nodes, the value can be arbitrary.
      * @return Updated partition info
      */
-    def update(instanceBitVector: BitSet, newNumNodeOffsets: Int,
+    def update(instanceBitVector: BitSet, activeNodeMap: JavaHashMap[Int, Int], newNumNodeOffsets: Int,
                labels: Array[Byte], metadata: AltDTMetadata): PartitionInfo = {
       // Create a 2-level representation of the new nodeOffsets (to be flattened).
       // These 2 levels correspond to original nodes and their children (if split).
       val newNodeOffsets = nodeOffsets.map(Array(_))
-      val newFullImpurityAggs = fullImpurityAggs.map(Array(_))
+      val newFullImpurityAggs = Array.fill[ImpurityAggregatorSingle](activeNodeMap.size)(metadata.createImpurityAggregator())
 
-      val newColumns = columns.zipWithIndex.map { case (col, index) =>
-        index match {
-          case 0 => first(col, instanceBitVector, metadata, labels, newNodeOffsets, newFullImpurityAggs)
-          case _ => rest(col, instanceBitVector, newNodeOffsets)
+      columns.zipWithIndex.foreach { case (col, index) =>
+        (index, col.sparse) match {
+          case (0, true) => firstSparse(col, instanceBitVector, newFullImpurityAggs, activeNodeMap, metadata, labels)
+          case (_, true) => restSparse(col, instanceBitVector, activeNodeMap)
+          case (0, false) => first(col, instanceBitVector, metadata, labels, newNodeOffsets, newFullImpurityAggs)
+          case (_, false) => rest(col, instanceBitVector, newNodeOffsets)
         }
-        col
       }
+      val newColumns = columns.map(col => new FeatureVector(col.featureIndex, col.featureArity,
+        col.values, col.indices, col.nodeIndices, col.compressedVals, col.sparse))
 
       // Identify the new activeNodes based on the 2-level representation of the new nodeOffsets.
       val newActiveNodes = new BitSet(newNumNodeOffsets - 1)
@@ -388,7 +464,7 @@ private[ml] object AltDT extends Logging {
         }
         i += 1
       }
-      PartitionInfo(newColumns, newNodeOffsets.flatten, newActiveNodes, newFullImpurityAggs.flatten)
+      PartitionInfo(newColumns, newNodeOffsets.flatten, newActiveNodes, newFullImpurityAggs)
     }
 
 
@@ -404,16 +480,14 @@ private[ml] object AltDT extends Logging {
      *                 new ImpurityAggregatorSingle
      */
     private def first(
-               col: FeatureVector,
-               instanceBitVector: BitSet,
-               metadata: AltDTMetadata,
-               labels: Array[Byte],
-               newNodeOffsets: Array[Array[Int]],
-               newFullImpurityAggs: Array[Array[ImpurityAggregatorSingle]]) = {
+                       col: FeatureVector,
+                       instanceBitVector: BitSet,
+                       metadata: AltDTMetadata,
+                       labels: Array[Byte],
+                       newNodeOffsets: Array[Array[Int]],
+                       newFullImpurityAggs: Array[ImpurityAggregatorSingle]) = {
+      var impurityAggIdx = 0
       activeNodes.iterator.foreach { nodeIdx =>
-        // WHAT TO OPTIMIZE:
-        // - try skipping numBitsSet
-        // - maybe uncompress bitmap
         val from = nodeOffsets(nodeIdx)
         val to = nodeOffsets(nodeIdx + 1)
 
@@ -482,12 +556,48 @@ private[ml] object AltDT extends Logging {
           }
           // END SORTING
 
-          newFullImpurityAggs(nodeIdx) = Array(leftImpurity, rightImpurity)
+          newFullImpurityAggs(impurityAggIdx) = leftImpurity
+          newFullImpurityAggs(impurityAggIdx + 1) = rightImpurity
+          impurityAggIdx += 2
           // update the column values and indices
           // with the corresponding indices
           System.arraycopy(tempVals, from, col.values, from, to - from)
           System.arraycopy(tempIndices, from, col.indices, from, to - from)
         }
+      }
+    }
+
+    /**
+     * Sort the very first column in the [[PartitionInfo.columns]]. While
+     * (by modifying @param newFullImpurityAggs).
+     * @param col The very first column in [[PartitionInfo.columns]]
+     * @param metadata Used to create new [[ImpurityAggregatorSingle]] for a new child
+     *                 node in the tree
+     * @param labels   Labels are read as we sort column to populate stats for each
+     *                 new ImpurityAggregatorSingle
+     */
+    private def firstSparse(
+                             col: FeatureVector,
+                             instanceBitVector: BitSet,
+                             newFullImpurityAggs: Array[ImpurityAggregatorSingle],
+                             activeNodeMap: JavaHashMap[Int, Int],
+                             metadata: AltDTMetadata,
+                             labels: Array[Byte]) = {
+      var idx = 0
+      while (idx < col.indices.length) {
+        val indexForVal = col.indices(idx)
+        var key = col.nodeIndices(idx) << 1
+        if (instanceBitVector.get(indexForVal)) {
+          key += 1
+        }
+        // -1 means that this node was not split
+        val nodeIndex = if (activeNodeMap.containsKey(key)) activeNodeMap.get(key) else -1
+        if (nodeIndex >= 0) {
+          val label = labels(indexForVal)
+          newFullImpurityAggs(nodeIndex).update(label)
+        }
+        col.nodeIndices(idx) = nodeIndex
+        idx += 1
       }
     }
 
@@ -508,20 +618,23 @@ private[ml] object AltDT extends Logging {
      *                    For instances at inactive (leaf) nodes, the value can be arbitrary.
      * @return Updated partition info
      */
-    def update(instanceBitVector: BitSet, newNumNodeOffsets: Int,
+    def update(instanceBitVector: BitSet, activeNodeMap: JavaHashMap[Int, Int], newNumNodeOffsets: Int,
                labels: Array[Double], metadata: AltDTMetadata): PartitionInfo = {
       // Create a 2-level representation of the new nodeOffsets (to be flattened).
       // These 2 levels correspond to original nodes and their children (if split).
       val newNodeOffsets = nodeOffsets.map(Array(_))
-      val newFullImpurityAggs = fullImpurityAggs.map(Array(_))
+      val newFullImpurityAggs = Array.fill[ImpurityAggregatorSingle](activeNodeMap.size)(metadata.createImpurityAggregator())
 
-      val newColumns = columns.zipWithIndex.map { case (col, index) =>
-        index match {
-          case 0 => first(col, instanceBitVector, metadata, labels, newNodeOffsets, newFullImpurityAggs)
-          case _ => rest(col, instanceBitVector, newNodeOffsets)
+      columns.zipWithIndex.foreach { case (col, index) =>
+        (index, col.sparse) match {
+          case (0, true) => firstSparse(col, instanceBitVector, newFullImpurityAggs, activeNodeMap, metadata, labels)
+          case (_, true) => restSparse(col, instanceBitVector, activeNodeMap)
+          case (0, false) => first(col, instanceBitVector, metadata, labels, newNodeOffsets, newFullImpurityAggs)
+          case (_, false) => rest(col, instanceBitVector, newNodeOffsets)
         }
-        col
       }
+      val newColumns = columns.map(col => new FeatureVector(col.featureIndex, col.featureArity,
+        col.values, col.indices, col.nodeIndices, col.compressedVals, col.sparse))
 
       // Identify the new activeNodes based on the 2-level representation of the new nodeOffsets.
       val newActiveNodes = new BitSet(newNumNodeOffsets - 1)
@@ -538,7 +651,7 @@ private[ml] object AltDT extends Logging {
         }
         i += 1
       }
-      PartitionInfo(newColumns, newNodeOffsets.flatten, newActiveNodes, newFullImpurityAggs.flatten)
+      PartitionInfo(newColumns, newNodeOffsets.flatten, newActiveNodes, newFullImpurityAggs)
     }
 
 
@@ -559,11 +672,9 @@ private[ml] object AltDT extends Logging {
                        metadata: AltDTMetadata,
                        labels: Array[Double],
                        newNodeOffsets: Array[Array[Int]],
-                       newFullImpurityAggs: Array[Array[ImpurityAggregatorSingle]]) = {
+                       newFullImpurityAggs: Array[ImpurityAggregatorSingle]) = {
+      var impurityAggIdx = 0
       activeNodes.iterator.foreach { nodeIdx =>
-        // WHAT TO OPTIMIZE:
-        // - try skipping numBitsSet
-        // - maybe uncompress bitmap
         val from = nodeOffsets(nodeIdx)
         val to = nodeOffsets(nodeIdx + 1)
 
@@ -587,7 +698,7 @@ private[ml] object AltDT extends Logging {
         }
 
         val numBitsNotSet = to - from - numBitsSet // number of instances splitting left
-      val oldOffset = newNodeOffsets(nodeIdx).head
+        val oldOffset = newNodeOffsets(nodeIdx).head
 
         // If numBitsNotSet or numBitsSet equals 0, then this node was not split,
         // so we do not need to update its part of the column. Otherwise, we update it.
@@ -632,12 +743,48 @@ private[ml] object AltDT extends Logging {
           }
           // END SORTING
 
-          newFullImpurityAggs(nodeIdx) = Array(leftImpurity, rightImpurity)
+          newFullImpurityAggs(impurityAggIdx) = leftImpurity
+          newFullImpurityAggs(impurityAggIdx + 1) = rightImpurity
+          impurityAggIdx += 2
           // update the column values and indices
           // with the corresponding indices
           System.arraycopy(tempVals, from, col.values, from, to - from)
           System.arraycopy(tempIndices, from, col.indices, from, to - from)
         }
+      }
+    }
+
+    /**
+     * Sort the very first column in the [[PartitionInfo.columns]]. While
+     * (by modifying @param newFullImpurityAggs).
+     * @param col The very first column in [[PartitionInfo.columns]]
+     * @param metadata Used to create new [[ImpurityAggregatorSingle]] for a new child
+     *                 node in the tree
+     * @param labels   Labels are read as we sort column to populate stats for each
+     *                 new ImpurityAggregatorSingle
+     */
+    private def firstSparse(
+                             col: FeatureVector,
+                             instanceBitVector: BitSet,
+                             newFullImpurityAggs: Array[ImpurityAggregatorSingle],
+                             activeNodeMap: JavaHashMap[Int, Int],
+                             metadata: AltDTMetadata,
+                             labels: Array[Double]) = {
+      var idx = 0
+      while (idx < col.indices.length) {
+        val indexForVal = col.indices(idx)
+        var key = col.nodeIndices(idx) << 1
+        if (instanceBitVector.get(indexForVal)) {
+          key += 1
+        }
+        // -1 means that this node was not split
+        val nodeIndex = if (activeNodeMap.containsKey(key)) activeNodeMap.get(key) else -1
+        if (nodeIndex >= 0) {
+          val label = labels(indexForVal)
+          newFullImpurityAggs(nodeIndex).update(label)
+        }
+        col.nodeIndices(idx) = nodeIndex
+        idx += 1
       }
     }
 
@@ -688,6 +835,27 @@ private[ml] object AltDT extends Logging {
       }
     }
 
+    /**
+     * Sort the remaining columns in the [[PartitionInfo.columns]]. Since
+     * we skip the computation for those here.
+     * @param col The very first column in [[PartitionInfo.columns]]
+     */
+    private def restSparse(
+                      col: FeatureVector,
+                      instanceBitVector: BitSet,
+                      activeNodeMap: JavaHashMap[Int, Int]) = {
+      var idx = 0
+      while (idx < col.indices.length) {
+        val indexForVal = col.indices(idx)
+        var key = col.nodeIndices(idx) << 1
+        if (instanceBitVector.get(indexForVal)) {
+          key += 1
+        }
+        col.nodeIndices(idx) = if (activeNodeMap.containsKey(key)) activeNodeMap.get(key)
+        else -1 // -1 means that this node was not split
+        idx += 1
+      }
+    }
   }
 
    /**
@@ -704,20 +872,25 @@ private[ml] object AltDT extends Logging {
   private[impl] class FeatureVector(
                                      val featureIndex: Int,
                                      val featureArity: Int,
-                                     val values: Array[Double],
-                                     val indices: Array[Int])
-    extends Serializable {
+                                     var values: Array[Double],
+                                     val indices: Array[Int],
+                                     // attributes for sparse continuous columns, which are run-length encoded
+                                     var nodeIndices: Array[Int] = null,
+                                     var compressedVals: Array[(Double, Int)] = null,
+                                     var sparse: Boolean = false) extends Serializable {
 
     def isCategorical: Boolean = featureArity > 0
 
     /** For debugging */
     override def toString: String = {
-      "  FeatureVector(" +
+      "  FeatureVector(\n" +
         s"    featureIndex: $featureIndex,\n" +
         s"    featureType: ${if (featureArity == 0) "Continuous" else "Categorical"},\n" +
+        s"    sparse: $sparse,\n" +
         s"    featureArity: $featureArity,\n" +
-        s"    values: ${values.mkString(", ")},\n" +
+        s"    values: ${if (sparse) compressedVals.mkString(", ") else values.mkString(", ")},\n" +
         s"    indices: ${indices.mkString(", ")},\n" +
+        s"    nodeIndices: ${if (sparse) nodeIndices.mkString(", ") else " null"},\n" +
         "  )"
     }
 
@@ -727,14 +900,27 @@ private[ml] object AltDT extends Logging {
     override def equals(other: Any): Boolean = {
       other match {
         case o: FeatureVector =>
-          featureIndex == o.featureIndex && featureArity == o.featureArity &&
-            values.sameElements(o.values) && indices.sameElements(o.indices)
+          if (sparse) {
+            if (o.sparse) {
+              featureIndex == o.featureIndex && featureArity == o.featureArity &&
+                compressedVals.sameElements(o.compressedVals) &&
+                indices.sameElements(o.indices) &&
+                nodeIndices.sameElements(o.nodeIndices)
+            } else false
+          } else {
+            if (o.sparse) false
+            else {
+              featureIndex == o.featureIndex && featureArity == o.featureArity &&
+                values.sameElements(o.values) && indices.sameElements(o.indices)
+            }
+          }
         case _ => false
       }
     }
   }
 
   private[impl] object FeatureVector {
+
     /** Store column sorted by feature values. */
     def fromOriginal(
                       featureIndex: Int,
@@ -742,20 +928,45 @@ private[ml] object AltDT extends Logging {
                       values: Array[Double]): FeatureVector = {
       val indices = values.indices.toArray
       val fv = new FeatureVector(featureIndex, featureArity, values, indices)
-      val sorter = new Sorter(new FeatureVectorSortByValue(featureIndex, featureArity))
+      val sorter = new Sorter(new FeatureVectorSortByValue())
       sorter.sort(fv, 0, values.length, Ordering[KeyWrapper])
+      // if the feature is categorical or there are only half as many distinct values,
+      // then run-length encoding is worth it
+      if (featureArity == 0 && values.length / values.distinct.length.toDouble > 2.0) {
+        fv.nodeIndices = new Array[Int](indices.length)
+        fv.compressedVals = runLengthEncoding(values)
+        fv.sparse = true
+        fv.values = null
+      }
       fv
+    }
+
+    def runLengthEncoding(values: Array[Double]): Array[(Double, Int)] = {
+      val rle = new ArrayBuffer[(Double, Int)]()
+      var currVal = values(0)
+      var i = 1
+      var count = 1
+      while (i < values.length) {
+        val nextVal = values(i)
+        if (nextVal != currVal) {
+          rle += ((currVal, count))
+          currVal = nextVal
+          count = 1
+        } else {
+          count += 1
+        }
+        i += 1
+      }
+      // add the last one
+      rle += ((currVal, count))
+      rle.toArray
     }
   }
 
   /**
     * Sort FeatureVector by values column; @see [[FeatureVector.fromOriginal()]]
-    * @param featureIndex @param featureArity Passed in so that, if a new
-    *                     FeatureVector is allocated during sorting, that new object
-    *                     also has the same featureIndex and featureArity
     */
-  private class FeatureVectorSortByValue(featureIndex: Int, featureArity: Int)
-    extends SortDataFormat[KeyWrapper, FeatureVector] {
+  private class FeatureVectorSortByValue extends SortDataFormat[KeyWrapper, FeatureVector] {
 
     override def newKey(): KeyWrapper = new KeyWrapper()
 
@@ -805,7 +1016,7 @@ private[ml] object AltDT extends Logging {
     }
 
     override def allocate(length: Int): FeatureVector = {
-      new FeatureVector(featureIndex, featureArity, new Array[Double](length), new Array[Int](length))
+      new FeatureVector(0, 0, new Array[Double](length), new Array[Int](length))
     }
 
     override def copyElement(src: FeatureVector,
