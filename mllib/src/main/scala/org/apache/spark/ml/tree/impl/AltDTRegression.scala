@@ -7,7 +7,6 @@ import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.collection.BitSet
 
 object AltDTRegression {
 
@@ -87,12 +86,7 @@ object AltDTRegression {
         val aggBitVector = AltDT.aggregateBitVector(partitionInfos, splits)
 
         val newPartitionInfos = partitionInfos.map { partitionInfo =>
-          val bv = new BitSet(numRows)
-          val iter = aggBitVector.getIntIterator
-          while(iter.hasNext) {
-            bv.set(iter.next)
-          }
-          partitionInfo.update(bv, activeNodeMap, labelsBc.value, metadata)
+          partitionInfo.update(aggBitVector, activeNodeMap, labelsBc.value, metadata)
         }
 
         newPartitionInfos.cache().count()

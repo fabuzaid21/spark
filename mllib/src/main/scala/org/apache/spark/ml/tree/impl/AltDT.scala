@@ -28,7 +28,6 @@ import org.apache.spark.mllib.tree.impurity.{Entropy, Gini, Impurity, Variance}
 import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
 import org.apache.spark.util.collection.{BitSet, SortDataFormat, Sorter}
-import org.roaringbitmap.RoaringBitmap
 import java.util.{HashMap => JavaHashMap}
 
 import scala.collection.mutable.ArrayBuffer
@@ -238,7 +237,8 @@ private[ml] object AltDT extends Logging {
    */
   private[impl] def aggregateBitVector(
       partitionInfos: RDD[PartitionInfo],
-      bestSplits: Array[Option[Split]]): RoaringBitmap = {
+      bestSplits: Array[Option[Split]],
+      numRows: Int): BitSet = {
 
     val bestSplitsBc: Broadcast[Array[Option[Split]]] =
       partitionInfos.sparkContext.broadcast(bestSplits)
@@ -255,9 +255,9 @@ private[ml] object AltDT extends Logging {
               val col = columns(colIndex)
               val bv = {
                 if (col.sparse) {
-                  bitVectorFromSplitSparse(col, nodeIndexInLevel, split)
+                  bitVectorFromSplitSparse(col, nodeIndexInLevel, split, numRows)
                 } else {
-                  bitVectorFromSplit(col, nodeIndexInLevel, split)
+                  bitVectorFromSplit(col, nodeIndexInLevel, split, numRows)
                 }
               }
               Iterator(bv)
@@ -270,15 +270,13 @@ private[ml] object AltDT extends Logging {
             // split, by how many instances go left/right.
             Iterator()
         }
-        val totalBitVector = bitvectorForNodes.fold(new RoaringBitmap()) { (acc, bitv) =>
-          acc.or(bitv)
-          acc
+        val totalBitVector = bitvectorForNodes.fold(new BitSet(0)) { (acc, bitv) =>
+          acc| bitv
         }
         totalBitVector
     }
-    val aggBitVector: RoaringBitmap = workerBitSubvectors.reduce { (acc, bitv) =>
-      acc.or(bitv)
-      acc
+    val aggBitVector: BitSet = workerBitSubvectors.reduce { (acc, bitv) =>
+      acc| bitv
     }
     bestSplitsBc.unpersist()
     aggBitVector
@@ -300,15 +298,16 @@ private[ml] object AltDT extends Logging {
   private[impl] def bitVectorFromSplit(
                                         col: FeatureVector,
                                         nodeIndex: Int,
-                                        split: Split): RoaringBitmap = {
-    val bitv = new RoaringBitmap()
+                                        split: Split,
+                                        numRows: Int): BitSet = {
+    val bitv = new BitSet(numRows)
     var i = 0
     while (i < col.nodeIndices.length) {
       if (col.nodeIndices(i) == nodeIndex) {
         val value = col.values(i)
         val idx = col.indices(i)
         if (!split.shouldGoLeft(value)) {
-          bitv.add(idx)
+          bitv.set(idx)
         }
       }
       i += 1
@@ -322,8 +321,9 @@ private[ml] object AltDT extends Logging {
   private[impl] def bitVectorFromSplitSparse(
                                         col: FeatureVector,
                                         nodeIndex: Int,
-                                        split: Split): RoaringBitmap = {
-    val bitv = new RoaringBitmap()
+                                        split: Split,
+                                        numRows: Int): BitSet = {
+    val bitv = new BitSet(numRows)
     var i = 0
     var valIndex = 0
     var valCountIndex = 0
@@ -340,7 +340,7 @@ private[ml] object AltDT extends Logging {
       if (col.nodeIndices(i) == nodeIndex) {
         val idx = col.indices(i)
         if (!split.shouldGoLeft(currVal)) {
-          bitv.add(idx)
+          bitv.set(idx)
         }
       }
       valCountIndex += 1
