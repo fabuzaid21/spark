@@ -8,7 +8,6 @@ import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.collection.BitSet
-import org.roaringbitmap.RoaringBitmap
 
 object AltDTRegression {
 
@@ -96,14 +95,9 @@ object AltDTRegression {
         val splits: Array[Option[Split]] = bestSplitsAndGains.map(_._1)
 
         // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right
-        val aggBitVector: RoaringBitmap = AltDT.aggregateBitVector(partitionInfos, splits, numRows)
+        val aggBitVector: BitSet = AltDT.aggregateBitVector(partitionInfos, splits, numRows)
         val newPartitionInfos = partitionInfos.map { partitionInfo =>
-          val bv = new BitSet(numRows)
-          val iter = aggBitVector.getIntIterator
-          while(iter.hasNext) {
-            bv.set(iter.next)
-          }
-          partitionInfo.update(bv, numNodeOffsets, labelsBc.value, metadata)
+          partitionInfo.update(aggBitVector, numNodeOffsets, labelsBc.value, metadata)
         }
         // TODO: remove.  For some reason, this is needed to make things work.
         // Probably messing up somewhere above...

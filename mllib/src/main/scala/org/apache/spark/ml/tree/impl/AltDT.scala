@@ -28,7 +28,6 @@ import org.apache.spark.mllib.tree.impurity.{Entropy, Gini, Impurity, Variance}
 import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
 import org.apache.spark.util.collection.{BitSet, SortDataFormat, Sorter}
-import org.roaringbitmap.RoaringBitmap
 
 
 /**
@@ -168,11 +167,11 @@ private[ml] object AltDT extends Logging {
     val colStoreInit: RDD[(Int, Array[Double])] = colStoreInput.getOrElse(
       rowToColumnStoreDense(input.map(_.features)))
     val numRows: Int = colStoreInit.first()._2.length
-    if (metadata.numClasses > 1 && metadata.numClasses <= 32) {
-      AltDTClassification.trainImpl(input, colStoreInit, metadata, numRows, strategy.maxDepth)
-    } else {
+//    if (metadata.numClasses > 1 && metadata.numClasses <= 32) {
+//      AltDTClassification.trainImpl(input, colStoreInit, metadata, numRows, strategy.maxDepth)
+//    } else {
       AltDTRegression.trainImpl(input, colStoreInit, metadata, numRows, strategy.maxDepth)
-    }
+//    }
   }
 
 
@@ -224,16 +223,16 @@ private[ml] object AltDT extends Logging {
   private[impl] def aggregateBitVector(
       partitionInfos: RDD[PartitionInfo],
       bestSplits: Array[Option[Split]],
-      numRows: Int): RoaringBitmap = {
+      numRows: Int): BitSet = {
     val bestSplitsBc: Broadcast[Array[Option[Split]]] =
       partitionInfos.sparkContext.broadcast(bestSplits)
-    val workerBitSubvectors: RDD[RoaringBitmap] = partitionInfos.map {
+    val workerBitSubvectors: RDD[BitSet] = partitionInfos.map {
       case PartitionInfo(columns: Array[FeatureVector], nodeOffsets: Array[Int],
                          activeNodes: BitSet, fullImpurities: Array[ImpurityAggregatorSingle]) =>
         val localBestSplits: Array[Option[Split]] = bestSplitsBc.value
         // localFeatureIndex[feature index] = index into PartitionInfo.columns
         val localFeatureIndex: Map[Int, Int] = columns.map(_.featureIndex).zipWithIndex.toMap
-        val bitSetForNodes: Iterator[RoaringBitmap] = activeNodes.iterator
+        val bitSetForNodes: Iterator[BitSet] = activeNodes.iterator
           .zip(localBestSplits.iterator).flatMap {
           case (nodeIndexInLevel: Int, Some(split: Split)) =>
             if (localFeatureIndex.contains(split.featureIndex)) {
@@ -252,14 +251,13 @@ private[ml] object AltDT extends Logging {
             Iterator()
         }
         if (bitSetForNodes.isEmpty) {
-          new RoaringBitmap()
+          new BitSet(numRows)
         } else {
-          bitSetForNodes.reduce[RoaringBitmap] { (acc, bitv) => acc.or(bitv); acc }
+          bitSetForNodes.reduce[BitSet] { (acc, bitv) => acc | bitv }
         }
     }
-    val aggBitVector: RoaringBitmap = workerBitSubvectors.reduce { (acc, bitv) =>
-      acc.or(bitv)
-      acc
+    val aggBitVector: BitSet = workerBitSubvectors.reduce { (acc, bitv) =>
+      acc | bitv
     }
     bestSplitsBc.unpersist()
     aggBitVector
@@ -285,14 +283,14 @@ private[ml] object AltDT extends Logging {
                                         from: Int,
                                         to: Int,
                                         split: Split,
-                                        numRows: Int): RoaringBitmap = {
-    val bitv = new RoaringBitmap()
+                                        numRows: Int): BitSet = {
+    val bitv = new BitSet(numRows)
     var i = from
     while (i < to) {
       val value = col.values(i)
       val idx = col.indices(i)
       if (!split.shouldGoLeft(value)) {
-        bitv.add(idx)
+        bitv.set(idx)
       }
       i += 1
     }
