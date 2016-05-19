@@ -168,11 +168,11 @@ private[ml] object AltDT extends Logging {
     val colStoreInit: RDD[(Int, Array[Double])] = colStoreInput.getOrElse(
       rowToColumnStoreDense(input.map(_.features)))
     val numRows: Int = colStoreInit.first()._2.length
-    if (metadata.numClasses > 1 && metadata.numClasses <= 32) {
-      AltDTClassification.trainImpl(input, colStoreInit, metadata, numRows, strategy.maxDepth)
-    } else {
+//    if (metadata.numClasses > 1 && metadata.numClasses <= 32) {
+//      AltDTClassification.trainImpl(input, colStoreInit, metadata, numRows, strategy.maxDepth)
+//    } else {
       AltDTRegression.trainImpl(input, colStoreInit, metadata, numRows, strategy.maxDepth)
-    }
+//    }
   }
 
 
