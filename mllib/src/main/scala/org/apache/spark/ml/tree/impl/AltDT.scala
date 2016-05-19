@@ -814,11 +814,11 @@ private[ml] object AltDT extends Logging {
       sorter.sort(fv, 0, values.length, Ordering[KeyWrapper])
       // if the featuer is categorical or there are only half as many distinct values,
       // then run-length encoding is worth it
-      if (initAggStats != null || values.length / values.distinct.length.toDouble > 2.0) {
-        fv.compressedVals = runLengthEncoding(values)
-        fv.sparse = true
-        fv.values = null
-      }
+      // if (initAggStats != null || values.length / values.distinct.length.toDouble > 2.0) {
+      //   fv.compressedVals = runLengthEncoding(values)
+      //   fv.sparse = true
+      //   fv.values = null
+      // }
       fv
     }
 
