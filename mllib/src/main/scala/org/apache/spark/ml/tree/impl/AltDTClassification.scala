@@ -6,6 +6,7 @@ import org.apache.spark.ml.tree.impl.AltDT.{AltDTMetadata, FeatureVector, Partit
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.rdd.RDD
+import org.apache.spark.serializer.KryoSerializer
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.collection.BitSet
 import org.roaringbitmap.RoaringBitmap
@@ -97,12 +98,16 @@ object AltDTClassification {
 
         // Aggregate bit vector (1 bit/instance) indicating whether each instance goes left/right
         val aggBitVector: RoaringBitmap = AltDT.aggregateBitVector(partitionInfos, splits, numRows)
+        val bv = new BitSet(numRows)
+        val iter = aggBitVector.getIntIterator
+        while(iter.hasNext) {
+          bv.set(iter.next)
+        }
+        val ser = new KryoSerializer(input.sparkContext.getConf).newInstance()
+        val buf = ser.serialize(aggBitVector)
+        val buf2 = ser.serialize(bv)
+        println(s"currentLevel: $currentLevel,  RoaringBitmap num bytes: ${buf.remaining()}, BitSet num bytes: ${buf2.remaining()}")
         val newPartitionInfos = partitionInfos.map { partitionInfo =>
-          val bv = new BitSet(numRows)
-          val iter = aggBitVector.getIntIterator
-          while(iter.hasNext) {
-            bv.set(iter.next)
-          }
           partitionInfo.update(bv, numNodeOffsets, labelsBc.value, metadata)
         }
         // TODO: remove.  For some reason, this is needed to make things work.
