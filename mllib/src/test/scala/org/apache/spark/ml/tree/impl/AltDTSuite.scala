@@ -20,14 +20,13 @@ package org.apache.spark.ml.tree.impl
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.ml.regression.DecisionTreeRegressor
 import org.apache.spark.ml.tree._
-import org.apache.spark.ml.tree.impl.AltDT.{PartitionInfo, AltDTMetadata, FeatureVector}
+import org.apache.spark.ml.tree.impl.AltDT.{AltDTMetadata, FeatureVector, PartitionInfo}
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.impurity._
 import org.apache.spark.mllib.tree.model.ImpurityStats
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.util.collection.BitSet
-import org.roaringbitmap.RoaringBitmap
 
 import scala.util.Random
 
@@ -148,7 +147,7 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
       FeatureVector.fromOriginal(0, 0, Array(0.8, 0.2, 0.1, 0.6))
     val col2 =
   FeatureVector.fromOriginal(1, 3, Array(0, 1, 0, 2))
-    val labels = Array(0, 0, 0, 1, 1, 1, 1).map(_.toByte)
+    val labels = Array(0, 1, 0, 1).map(_.toByte)
     val metadata = new AltDTMetadata(numClasses = 2, maxBins = 4, minInfoGain = 0.0, Entropy, Map(1 -> 3))
     val fullImpurityAgg = metadata.createImpurityAggregator()
     labels.foreach(label => fullImpurityAgg.update(label))
@@ -164,9 +163,9 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
 
     // Create bitVector for splitting the 4 rows: L, R, L, R
     // New groups are {0, 2}, {1, 3}
-    val bitVector = new RoaringBitmap()
-    bitVector.add(1)
-    bitVector.add(3)
+    val bitVector = new BitSet(4)
+    bitVector.set(1)
+    bitVector.set(3)
 
     // for these tests, use the activeNodes for nodeSplitBitVector
     val newInfo = info.update(bitVector, newNumNodeOffsets = 3, labels, metadata)
@@ -182,31 +181,35 @@ class AltDTSuite extends SparkFunSuite with MLlibTestSparkContext  {
     assert(newInfo.activeNodes.iterator.toSet === Set(0, 1))
 
     // stats for the two child nodes should be correct
-//    val fullImpurityStatsArray =
-//      Array(labels.count(_ == 0.0).toDouble, labels.count(_ == 1.0).toDouble)
-//    val fullImpurity = Entropy.calculate(fullImpurityStatsArray, labels.length)
-//    val stats = newInfo.fullImpurityAggs(0).getCalculator.
-//    assert(stats.gain === 0.0)
-//    assert(stats.impurity === fullImpurity)
-//    assert(stats.impurityCalculator.stats === fullImpurityStatsArray)
+    val stats00 = newInfo.fullImpurityAggs(0).getCalculator.stats
+    assert(stats00.sameElements(Array(2.0, 0.0))) // 2 0's, 0 1's
+    val stats01 = newInfo.fullImpurityAggs(1).getCalculator.stats
+    assert(stats01.sameElements(Array(0.0, 2.0))) // 0 0's, 2 1's
 
     // Create 2 bitVectors for splitting into: 0, 2, 1, 3
-    val bitVector2 = new RoaringBitmap()
-    bitVector2.add(2) // 2 goes to the right
-    bitVector2.add(3) // 3 goes to the right
-
-    val newInfo2 = newInfo.update(bitVector2, newNumNodeOffsets = 5, labels, metadata)
-
+    val bitVector2 = new BitSet(4)
+    bitVector2.set(2) // 2 goes to the right
+    bitVector2.set(3) // 3 goes to the right
+     val newInfo2 = newInfo.update(bitVector2, newNumNodeOffsets = 5, labels, metadata)
     assert(newInfo2.columns.length === 2)
-    val expectedCol2a =
-      new FeatureVector(0, 0, Array(0.8, 0.1, 0.2, 0.6), Array(0, 2, 1, 3))
-    val expectedCol2b =
-      new FeatureVector(1, 3, Array(0, 0, 1, 2), Array(0, 2, 1, 3))
+    val expectedCol2a = new FeatureVector(0, 0, Array(0.8, 0.1, 0.2, 0.6), Array(0, 2, 1, 3))
+    val expectedCol2b = new FeatureVector(1, 3, Array(0, 0, 1, 2), Array(0, 2, 1, 3))
     assert(newInfo2.columns(0) === expectedCol2a)
     assert(newInfo2.columns(1) === expectedCol2b)
     assert(newInfo2.nodeOffsets === Array(0, 1, 2, 3, 4))
     assert(newInfo2.activeNodes.iterator.toSet === Set(0, 1, 2, 3))
+
+    // stats for the two child nodes should be correct
+    val stats10 = newInfo2.fullImpurityAggs(0).getCalculator.stats
+    assert(stats10.sameElements(Array(1.0, 0.0))) // 1 0's, 0 1's
+    val stats11 = newInfo2.fullImpurityAggs(1).getCalculator.stats
+    assert(stats11.sameElements(Array(1.0, 0.0))) // 1 0's, 0 1's
+    val stats12 = newInfo2.fullImpurityAggs(2).getCalculator.stats
+    assert(stats12.sameElements(Array(0.0, 1.0))) // 0 0's, 1 1's
+    val stats13 = newInfo2.fullImpurityAggs(3).getCalculator.stats
+    assert(stats13.sameElements(Array(0.0, 1.0))) // 0 0's, 1 1's
   }
+
 
   /* * * * * * * * * * * Choosing Splits  * * * * * * * * * * */
 
